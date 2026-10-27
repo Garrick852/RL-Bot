@@ -266,6 +266,29 @@ transcription of the MQL5 algorithm matches pandas within `1e-9`; they cannot
 show that MetaEditor compiles the `.mqh` files or that MT5 produces identical
 numbers. None of these files is wired into an EA or into any trading path.
 
+### Alpha training CLI (`train_alpha.py`)
+
+Train and export the alpha from the **same hash-locked dataset** that the RL
+config uses. `alpha_label_end` must find the alpha's last feature row in that
+file.
+
+```powershell
+python train_alpha.py data\US500_M15.csv --dataset-sha256 <sha> `
+  --rl-train-start 2024-01-01T00:00:00+00:00 --horizon 4 --output-dir reports\alpha
+```
+
+Only rows strictly before `--rl-train-start` (and optionally at or after
+`--alpha-start`) are used. Labels are generated inside that partition, so no
+label bar reaches the RL split. Feature windows default to
+`TabularFeatureEngineer` values; `--n-splits`, `--seed`, `--n-estimators`,
+`--max-depth`, and `--learning-rate` are explicit. The command writes the ONNX
+file, manifest, Z-score CSV, and `train_alpha.report.json` (purged
+walk-forward OOS metrics plus provenance). It then reloads them through the
+orchestrator's `load_alpha_model` and re-checks the leakage barrier. Existing
+artifacts are never overwritten, and any failure removes partial output and
+exits `1`. Copy the printed `features_config` into the experiment's `features`
+section. Fold metrics are research evidence, not acceptance.
+
 ## Milestone 2 workstream: current-quote trading environment
 
 `engine_rl/envs/trading_env.py` implements a separate Gymnasium `TradingEnv`.
