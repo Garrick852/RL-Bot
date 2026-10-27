@@ -687,18 +687,53 @@ process lock; after a hard kill, inspect the old process and lock before
 manually clearing a stale lock. Unfinished trials/artifacts remain evidence,
 not successful results. Thread limits do not replace VPS temperature monitoring.
 
-Each new eligible high-water mark atomically writes the best trial's **sampled
-parameter dictionary** to `config\best_candidate_config.json`. This is not a
-fully runnable config or active configuration. Resume repairs a missing export
+Each new eligible high-water mark atomically writes a **hash-bound holdout
+candidate** (`contract: holdout_candidate_v1`) to `config\best_candidate_config.json`:
+the sampled `params`, the trial config path and SHA-256, a persisted
+`candidate_evidence.json` (the trial's full audit, including frozen model paths
+and SHAs) path and SHA-256, and `theta_accept`, which is the predeclared
+`research_gate_thresholds.min_profit_factor` (never derived from search results).
+This is not a runnable active configuration. Resume repairs a missing export
 from the committed best trial. Trials always call `run_pipeline(..., deploy=False)`;
 no build work, notifications, or fallback-journal changes are requested.
 
 **Repeatedly optimizing on the test partition makes it search data.** Trial
 configs explicitly mark reused-holdout search, audits retain numeric metrics
 and `threshold_pass` but cannot grant research `pass`, and the build gate rejects
-search configs. Freeze the chosen parameters into a separate experiment and
-evaluate a genuinely fresh untouched holdout before considering acceptance.
-Neither a high objective nor the exported dictionary authorizes deployment.
+search configs. Evaluate the candidate once on a genuinely fresh untouched
+holdout with `scripts\holdout_eval.py` before considering acceptance.
+Neither a high objective nor the exported candidate authorizes deployment.
+
+### Single-shot true holdout (`scripts\holdout_eval.py`)
+
+```powershell
+python scripts\holdout_eval.py --data holdout.csv --sha256 <64-hex> `
+  --config config\best_candidate_config.json `
+  --holdout-start 2025-01-02T14:30:00+00:00 --holdout-end 2025-03-01T00:00:00+00:00 `
+  --rth-schedule holdout_rth.json
+```
+
+Order of operations:
+
+1. Hash `--data`; a mismatch raises `ValueError` and burns nothing.
+2. Refuse with `HoldoutAlreadyUsedError` if `data\holdout_used.flag` or
+   `reports\true_holdout_eval.json` already exists.
+3. Preflight without reading holdout contents: candidate contract, trial config,
+   evidence, every seed's frozen `linear_actor` model, and alpha manifest/ONNX
+   SHAs; profile validation; `theta_accept` not weaker than `min_profit_factor`;
+   `--holdout-start` not before the end of every search split.
+4. Create the flag exclusively (`O_EXCL`, read-only). The holdout is now burned.
+5. Load the CSV, apply the config gap policy against the `--rth-schedule`
+   JSON list, use bars before `--holdout-start` only as alpha warm-up, run
+   `attach_alpha`, and evaluate every predeclared seed's frozen policy.
+
+`reports\true_holdout_eval.json` always records `median_oos` (median Profit
+Factor across seeds, `null` if undefined), `reconciliation_ok`, `gap_ok`,
+`evaluated_once: true`, and `accepted` (`median_oos >= theta_accept` and every
+check true), plus dataset, schedule, candidate, and per-seed evidence. Failures
+after the burn are recorded, not retried. Exit codes: `0` accepted, `1` rejected
+or failed after the burn, `2` refused before the burn (or already burned).
+Acceptance is research evidence only; it does not run `--deploy`.
 
 ## Milestone 3 workstream: adaptive fallback directives
 

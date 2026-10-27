@@ -1,6 +1,7 @@
 """Persistent search, exact medians, air-gap enforcement, and real PPO wiring."""
 
 import copy
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -79,7 +80,18 @@ def test_trials_copy_config_inject_parameters_and_export_exact_best_dictionary(e
     assert seen[0]["training"]["ppo_hyperparameters"]["ent_coef"] == study.trials[0].params["ent_coef"]
     assert seen[0]["training"]["ppo_hyperparameters"]["batch_size"] == study.trials[0].params["batch_size"]
     assert set(study.trials[0].params) == {"learning_rate", "ent_coef", "batch_size"}
-    assert json.loads(Path("config/best_candidate_config.json").read_text()) == best
+    candidate = json.loads(Path("config/best_candidate_config.json").read_text())
+    assert candidate["contract"] == "holdout_candidate_v1"
+    assert candidate["params"] == best
+    assert candidate["objective"] == {"metric": "median_profit_factor", "value": 1.5}
+    assert candidate["theta_accept"] == {
+        "metric": "median_profit_factor",
+        "value": experiment.config["evaluation"]["research_gate_thresholds"]["min_profit_factor"],
+    }
+    for kind in ("trial_config", "evidence"):
+        artifact = Path(candidate[f"{kind}_path"])
+        assert hashlib.sha256(artifact.read_bytes()).hexdigest() == candidate[f"{kind}_sha256"]
+    assert json.loads(Path(candidate["evidence_path"]).read_text())["median_oos_metrics"]["profit_factor"] == 1.5
     assert Path("reports/optuna_vps_study.db").is_file()
     assert isinstance(study.sampler, optuna.samplers.TPESampler)
     assert study.trials[0].user_attrs["eligible_objective"] is True
@@ -94,7 +106,7 @@ def test_sqlite_resume_adds_trials_and_repairs_missing_export(experiment):
     assert first.study_name == second.study_name
     assert len(second.trials) == 2
     assert second.trials[1].number == 1
-    assert json.loads(Path("config/best_candidate_config.json").read_text()) == second.best_params
+    assert json.loads(Path("config/best_candidate_config.json").read_text())["params"] == second.best_params
     assert not Path("reports/optuna_vps_study.lock").exists()
 
 
@@ -147,13 +159,31 @@ def test_export_only_changes_on_strict_high_water_mark(experiment):
         trial = optuna.trial.create_trial(
             params={"learning_rate": param},
             distributions={"learning_rate": optuna.distributions.FloatDistribution(1e-5, 1e-3, log=True)},
-            value=value, user_attrs={"eligible_objective": True},
+            value=value, user_attrs={
+                "eligible_objective": True, "trial_config_path": f"t{param}.json", "trial_config_sha256": "a" * 64,
+                "evidence_path": f"e{param}.json", "evidence_sha256": "b" * 64,
+            },
         )
         study.add_trial(trial)
         with patch("optimizer._atomic_json", wraps=optimizer_module._atomic_json) as write:
             optimizer.export_best(study, study.trials[-1])
             assert write.call_count == (1 if value == 2.0 or param == 1e-4 else 0)
-    assert json.loads(optimizer.candidate_path.read_text()) == {"learning_rate": 4e-4}
+    candidate = json.loads(optimizer.candidate_path.read_text())
+    assert candidate["params"] == {"learning_rate": 4e-4}
+    assert candidate["evidence_path"] == "e0.0004.json"
+
+
+def test_best_trial_without_hash_bound_evidence_is_not_exported(experiment):
+    optimizer = OfflineOptimizer(experiment.path)
+    study = optuna.create_study(direction="maximize")
+    study.add_trial(optuna.trial.create_trial(
+        params={"learning_rate": 1e-4},
+        distributions={"learning_rate": optuna.distributions.FloatDistribution(1e-5, 1e-3, log=True)},
+        value=2.0, user_attrs={"eligible_objective": True},
+    ))
+    with pytest.raises(ValueError, match="hash-bound"):
+        optimizer.export_best(study, study.trials[-1])
+    assert not optimizer.candidate_path.exists()
 
 
 def test_unconfigured_placeholder_is_refused_and_base_cannot_be_overwritten(experiment):

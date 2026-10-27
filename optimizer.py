@@ -30,6 +30,8 @@ from orchestrator import (
 LOGGER = logging.getLogger(__name__)
 STORAGE_URL = "sqlite:///reports/optuna_vps_study.db"
 STUDY_NAME = "offline_ppo_vps"
+CANDIDATE_CONTRACT = "holdout_candidate_v1"
+CANDIDATE_EVIDENCE_NAME = "candidate_evidence.json"
 SAMPLER_SEED = 852
 SEARCH_SPACE = {
     "version": 2, "metric": "median_profit_factor", "sampler_seed": SAMPLER_SEED,
@@ -48,7 +50,8 @@ class OfflineOptimizer:
         max_workers: Upper bound on parallel seed workers; trials themselves
             are always sequential. Each seed retains one numerical thread.
         study_name: Persistent study identity within the fixed local database.
-        candidate_path: Best sampled parameter dictionary, not an active config.
+        candidate_path: Hash-bound holdout candidate (params, trial config and
+            evidence SHAs, predeclared theta_accept), not an active config.
     """
 
     def __init__(
@@ -148,6 +151,12 @@ class OfflineOptimizer:
                 median, reported, rel_tol=0, abs_tol=1e-12,
             ):
                 raise ValueError("reported median does not match every configured seed")
+            # Hash-bound copy of the exact evidence (frozen model paths/SHAs) for holdout_eval.
+            evidence_path = directory / CANDIDATE_EVIDENCE_NAME
+            _atomic_json(evidence_path, report)
+            trial.set_user_attr("trial_config_sha256", hashlib.sha256(config_path.read_bytes()).hexdigest())
+            trial.set_user_attr("evidence_path", str(evidence_path))
+            trial.set_user_attr("evidence_sha256", hashlib.sha256(evidence_path.read_bytes()).hexdigest())
             trial.set_user_attr("eligible_objective", True)
             return float(median)
         except optuna.TrialPruned:
@@ -172,7 +181,28 @@ class OfflineOptimizer:
             raise ValueError("best trial lacks verified multi-seed search evidence")
         if best.number == self._exported_best:
             return
-        _atomic_json(self.candidate_path, best.params)
+        missing = {"trial_config_path", "trial_config_sha256", "evidence_path", "evidence_sha256"} - set(
+            best.user_attrs
+        )
+        if missing:
+            raise ValueError(f"best trial lacks hash-bound candidate evidence: {sorted(missing)}")
+        candidate = {
+            "contract": CANDIDATE_CONTRACT,
+            "trial_number": best.number,
+            "objective": {"metric": "median_profit_factor", "value": best.value},
+            "params": dict(best.params),
+            "trial_config_path": best.user_attrs["trial_config_path"],
+            "trial_config_sha256": best.user_attrs["trial_config_sha256"],
+            "evidence_path": best.user_attrs["evidence_path"],
+            "evidence_sha256": best.user_attrs["evidence_sha256"],
+            # Predeclared before any holdout is seen; never derived from search results.
+            "theta_accept": {
+                "metric": "median_profit_factor",
+                "value": self.base_config["evaluation"]["research_gate_thresholds"]["min_profit_factor"],
+            },
+            "requires_fresh_holdout": True,
+        }
+        _atomic_json(self.candidate_path, candidate)
         self._exported_best = best.number
         LOGGER.info("Exported search high-water mark trial=%s median_PF=%s", best.number, best.value)
 
