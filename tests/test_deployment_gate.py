@@ -1,34 +1,72 @@
-"""Opt-in build, persistent fallback, and notifier-isolation integration tests."""
+"""Opt-in build, policy/alpha injection, persistent fallback, and notifier-isolation tests."""
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 
+from alpha_fixtures import install_alpha
 from engine_mt5.patcher import CompilationError, SourcePatchError
+from engine_rl import linear_policy as contract
 from governance.validator import ValidationState
-from orchestrator import OfflineOrchestrator
+from models.onnx_bridge import load_manifest, mql5_zscore_inputs
+from orchestrator import POLICY_PARAMETER_BINDING, OfflineOrchestrator
+from test_ea_template import TEMPLATE, contract_env, parse_matrix, parse_vector
+
+SEEDS = (7, 42, 99)
+
+
+@pytest.fixture(scope="module")
+def policies(tmp_path_factory):
+    """Untrained but structurally exact linear-actor and MLP PPO checkpoints."""
+    torch = pytest.importorskip("torch")
+    from stable_baselines3 import PPO
+
+    directory = tmp_path_factory.mktemp("policies")
+    previous = torch.get_num_threads()
+    try:
+        models = {}
+        for name, arch in (("linear", {"pi": [], "vf": [128, 128]}), ("mlp", {"pi": [16], "vf": [16]})):
+            model = PPO("MlpPolicy", contract_env(60), policy_kwargs={"net_arch": arch}, seed=3, device="cpu")
+            path = directory / f"{name}.zip"
+            model.save(path)
+            models[name] = path
+        expected = contract.export_linear_policy(PPO.load(models["linear"], device="cpu"))
+    finally:
+        torch.set_num_threads(previous)
+    return models, expected
 
 
 @pytest.fixture
-def gate(tmp_path):
+def gate(tmp_path, policies):
+    models, _ = policies
     source = tmp_path / "strategy.mq5"
-    source.write_text("input int InpFast = 5; // OPTIMIZED:InpFast\n")
+    source.write_bytes(TEMPLATE.read_bytes())
     source.with_suffix(".ex5").write_bytes(b"original binary")
+    manifest_name, manifest_sha = install_alpha(tmp_path)
+    manifest = load_manifest(tmp_path / manifest_name)
     orchestrator = OfflineOrchestrator(tmp_path / "reports")
     orchestrator._config_base = tmp_path
     orchestrator.config = {
         "dataset": {"symbol": "TEST"},
+        "training": {"seeds": list(SEEDS)},
+        "features": {"alpha_manifest_path": manifest_name, "alpha_manifest_sha256": manifest_sha},
         "deployment": {
             "source_path": str(source), "metaeditor_path": str(tmp_path / "metaeditor64.exe"),
             "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-            "parameters": {"InpFast": 8},
-            "parameter_binding": "fixed_strategy_parameters_not_ppo_policy",
+            "parameters": {},
+            "parameter_binding": POLICY_PARAMETER_BINDING, "policy_seed": 42,
         },
     }
-    orchestrator.context = {"run_id": "candidate-1", "deployment": {"requested": True}}
+    orchestrator.context = {
+        "run_id": "candidate-1", "deployment": {"requested": True},
+        "alpha": {"manifest_sha256": manifest_sha, "onnx_sha256": manifest["onnx_sha256"]},
+    }
+    model_sha = hashlib.sha256(models["linear"].read_bytes()).hexdigest()
     report = {
         "run_kind": "SB3_PPO_MULTI_SEED", "rl_training_performed": True,
         "run_status": "COMPLETE",
@@ -36,6 +74,10 @@ def gate(tmp_path):
         "pass": True, "median_oos_metrics": {
             "profit_factor": 1.5, "sharpe": 1.2, "max_drawdown": .05,
         },
+        "results": [{"seed": seed, "training": {
+            "model_path": str(models["linear"]), "model_sha256": model_sha,
+            "policy_architecture": "linear_actor",
+        }} for seed in SEEDS],
     }
     notifier = Mock()
     notifier.send_deployment_success.return_value = True
@@ -43,6 +85,10 @@ def gate(tmp_path):
     notifier.send_circuit_breaker.return_value = True
     with patch("governance.telegram_notifier.TelegramAlertEngine", return_value=notifier):
         yield orchestrator, report, source, notifier
+
+
+def input_value(text, name):
+    return re.search(rf"^input\s+\w+\s+{name}\s*=\s*([^;]+);", text, re.M).group(1).strip()
 
 
 def compile_fixture(_compiler, source):
@@ -60,18 +106,38 @@ def journal(orchestrator):
     return json.loads(paths[0].read_text())
 
 
-def test_success_patches_and_compiles_staged_source_only(gate):
+def test_success_injects_verified_policy_and_alpha_into_staged_source_only(gate, policies):
     orchestrator, report, source, notifier = gate
+    _, expected = policies
+    original = source.read_bytes()
     with patch("engine_mt5.patcher.MQL5Patcher.compile_ea", side_effect=compile_fixture):
         result = orchestrator.execute_deployment_gate(report)
-    assert result["status"] == "STAGED_BUILD_SUCCEEDED"
-    assert "InpFast = 8;" in Path(result["staged_source"]).read_text()
-    assert "InpFast = 5;" in source.read_text()
+    assert result["status"] == "STAGED_BUILD_SUCCEEDED", result.get("reason")
+    staged = Path(result["staged_source"]).read_text()
+    weights = parse_matrix(staged, "PPO_WEIGHTS")
+    bias = parse_vector(staged, "PPO_BIAS")
+    assert weights.shape == (contract.ACTION_DIM, contract.OBS_DIM)
+    np.testing.assert_array_equal(weights, np.asarray(expected["PPO_WEIGHTS"]))
+    np.testing.assert_array_equal(bias, np.asarray(expected["PPO_BIAS"]))
+    manifest = load_manifest(source.parent / "xgb_alpha.manifest.json")
+    for name, value in mql5_zscore_inputs(manifest).items():
+        assert float(input_value(staged, name)) == value
+    windows = manifest["feature_engineer"]
+    assert int(input_value(staged, "InpRsiWindow")) == windows["rsi_window"]
+    assert int(input_value(staged, "InpMacdSlow")) == windows["macd_slow"]
+    assert int(input_value(staged, "InpPAWindow")) == windows["price_action_window"]
+    assert source.read_bytes() == original
     assert source.with_suffix(".ex5").read_bytes() == b"original binary"
-    assert result["policy_exported"] is False
+    assert result["policy_exported"] is True
+    assert result["policy_seed"] == 42
+    assert result["policy_model_sha256"] == report["results"][1]["training"]["model_sha256"]
+    assert result["alpha_onnx_sha256"] == manifest["onnx_sha256"]
+    assert result["required_onnx_file"] == "xgb_alpha.onnx"
     assert result["live_deployment_performed"] is False
     assert journal(orchestrator)["consecutive_failures"] == 0
     notifier.send_deployment_success.assert_called_once()
+    summary = notifier.send_deployment_success.call_args.args[2]
+    assert "PPO_WEIGHTS" not in summary and summary["policy_seed"] == 42
     assert not list((orchestrator.report_directory / "fallback").glob("*.lock"))
 
 
@@ -126,9 +192,37 @@ def test_real_missing_anchor_never_invokes_compiler(gate):
     notifier.send_circuit_breaker.assert_called_once()
 
 
-def test_policy_matrix_parameters_are_refused_by_fixed_parameter_gate(gate):
+def test_config_supplied_policy_matrix_or_alpha_override_is_refused(gate):
     orchestrator, report, source, _ = gate
-    orchestrator.config["deployment"]["parameters"] = {"InpFast": 8, "PPO_WEIGHTS": [[0.0] * 12] * 4}
+    for parameters in ({"PPO_WEIGHTS": [[0.0] * 12] * 3}, {"InpAlphaMean0": 0.0}, {"InpRsiWindow": 99}):
+        orchestrator.config["deployment"]["parameters"] = parameters
+        with patch("engine_mt5.patcher.MQL5Patcher") as patcher:
+            result = orchestrator.execute_deployment_gate(report)
+        assert result["status"] == "INVALID"
+        patcher.assert_not_called()
+        orchestrator.context["run_id"] += "-next"
+    assert not list(source.parent.glob("*.staged.mq5"))
+
+
+@pytest.mark.parametrize("tamper", ["mlp", "model_sha", "seed", "binding", "alpha", "undeclared_seed"])
+def test_unverifiable_policy_or_alpha_never_reaches_patcher(gate, policies, tamper):
+    orchestrator, report, source, _ = gate
+    models, _ = policies
+    selected = report["results"][1]["training"]
+    if tamper == "mlp":
+        selected.update(model_path=str(models["mlp"]),
+                        model_sha256=hashlib.sha256(models["mlp"].read_bytes()).hexdigest(),
+                        policy_architecture="mlp_tanh_128x128")
+    elif tamper == "model_sha":
+        selected["model_sha256"] = "0" * 64
+    elif tamper == "seed":
+        report["results"] = [row for row in report["results"] if row["seed"] != 42]
+    elif tamper == "binding":
+        orchestrator.config["deployment"]["parameter_binding"] = "fixed_strategy_parameters_not_ppo_policy"
+    elif tamper == "alpha":
+        orchestrator.context["alpha"]["onnx_sha256"] = "0" * 64
+    else:
+        orchestrator.config["deployment"]["policy_seed"] = 5
     with patch("engine_mt5.patcher.MQL5Patcher") as patcher:
         result = orchestrator.execute_deployment_gate(report)
     assert result["status"] == "INVALID"
@@ -152,8 +246,8 @@ def test_unauthorized_gate_has_no_source_journal_or_notification_effects(gate):
     orchestrator, report, source, notifier = gate
     orchestrator.context["deployment"]["requested"] = False
     assert orchestrator.execute_deployment_gate(report)["status"] == "BLOCKED_NOT_AUTHORIZED"
-    assert not orchestrator.report_directory.exists()
-    assert "InpFast = 5;" in source.read_text()
+    assert orchestrator.report_directory.exists() is False
+    assert source.read_bytes() == TEMPLATE.read_bytes()
     notifier.send_circuit_breaker.assert_not_called()
     notifier.send_deployment_success.assert_not_called()
 
@@ -189,4 +283,4 @@ def test_search_evidence_cannot_enter_build_gate(gate):
         assert "fresh holdout" in result["reason"]
         patcher.assert_not_called()
     assert not orchestrator.report_directory.exists()
-    assert "InpFast = 5;" in source.read_text()
+    assert source.read_bytes() == TEMPLATE.read_bytes()

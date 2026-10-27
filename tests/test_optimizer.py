@@ -59,9 +59,11 @@ def test_trials_copy_config_inject_parameters_and_export_exact_best_dictionary(e
         assert Path(config["dataset"]["path"]).is_absolute()
         assert config["orchestration"]["max_workers"] == 1
         assert config["training"]["threads_per_worker"] == 1
-        assert config["features"]["warmup_bars"] == (
-            config["orchestration"]["k_multiplier"] * config["strategy"]["ema"]["slow_period"]
-        )
+        assert Path(config["features"]["alpha_manifest_path"]).is_absolute()
+        assert config["features"] == {
+            **experiment.config["features"], "alpha_manifest_path": config["features"]["alpha_manifest_path"],
+        }
+        assert config["strategy"] == experiment.config["strategy"]
         return evidence(config)
 
     with patch("optimizer.OfflineOrchestrator.run_pipeline", side_effect=pipeline), \
@@ -75,7 +77,8 @@ def test_trials_copy_config_inject_parameters_and_export_exact_best_dictionary(e
     best = study.best_params
     assert seen[0]["training"]["ppo_hyperparameters"]["learning_rate"] == study.trials[0].params["learning_rate"]
     assert seen[0]["training"]["ppo_hyperparameters"]["ent_coef"] == study.trials[0].params["ent_coef"]
-    assert seen[0]["strategy"]["ema"]["slow_period"] == study.trials[0].params["ema_slow_period"]
+    assert seen[0]["training"]["ppo_hyperparameters"]["batch_size"] == study.trials[0].params["batch_size"]
+    assert set(study.trials[0].params) == {"learning_rate", "ent_coef", "batch_size"}
     assert json.loads(Path("config/best_candidate_config.json").read_text()) == best
     assert Path("reports/optuna_vps_study.db").is_file()
     assert isinstance(study.sampler, optuna.samplers.TPESampler)
@@ -197,7 +200,7 @@ def test_fresh_serial_studies_have_seeded_matching_first_suggestions(experiment)
 
 def test_real_optuna_trial_trains_all_seeds_with_sampled_profile(experiment):
     times = experiment.frame["timestamp"]
-    for name, start, end in (("train", 130, 170), ("validation", 170, 190), ("test", 190, 230)):
+    for name, start, end in (("train", 170, 230), ("validation", 230, 260), ("test", 260, 320)):
         experiment.config["splits"][name] = {
             "start": (times.iloc[0] + pd.Timedelta(minutes=start)).isoformat(),
             "end": (times.iloc[0] + pd.Timedelta(minutes=end)).isoformat(),

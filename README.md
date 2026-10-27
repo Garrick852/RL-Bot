@@ -360,8 +360,8 @@ ignored or converted:
 | Root metadata | `template_version: 1`, `specification_status: "FROZEN_PPO_RESEARCH"`, `frozen: true` |
 | Dataset | `format: "csv"`, `timezone: "UTC"`, explicit pandas fixed `timeframe` such as `"1min"`, `price_basis: "bid_ask"`, `timestamp_meaning: "execution_quote_time"`, `missing_bar_policy: "explicit_rth_schedule"` |
 | Column mapping | Identity mapping of `timestamp/open/high/low/close/volume/bid/ask` to those same names |
-| Strategy features | `name: "fixed_ema_crossover"`, positive fast < slow periods, `ema.initialization_rule: "first_close_quantized"`; PPO uses those features, while the fixed baseline follows their crossover |
-| Features | `ordered_names: ["ema_fast", "ema_slow"]`, `scaler_method: "standard"`, `scaler_fit_partition: "train_only"`, `refit_on_validation_or_test: false`; `warmup_bars` must equal k × slow |
+| Strategy features | `name: "fixed_ema_crossover"`, positive fast < slow periods, `ema.initialization_rule: "first_close_quantized"`; these EMAs drive only the fixed crossover baseline, never the PPO observation |
+| Features | `observation_contract: "alpha_linear_policy_12x3_v1"`, `ordered_names` equal to the 12 `engine_rl.linear_policy.OBSERVATION_NAMES`, `alpha_manifest_path` + exact `alpha_manifest_sha256`, positive integer `warmup_bars`, `scaler_method: "alpha_manifest_zscore"`, `scaler_fit_partition: "alpha_training_partition"`, `refit_on_validation_or_test: false` |
 | Policy | `controls: "target_position"`, `action_space_type: "discrete"`, explicit `{"0": -1, "1": 0, "2": 1}` mapping, `reward_definition: "liquidation_equity_delta"` |
 | Training section | `algorithm: "PPO"`, `device: "cpu"`, `threads_per_worker: 1`, at least 3 distinct uint32 integer `seeds`, positive integer `total_timesteps_per_seed`, `checkpoint_selection_rule: "final_checkpoint"` |
 | PPO hyperparameters | Six required keys: `n_steps: 2048`, `batch_size`, `learning_rate`, `clip_range: 0.2`, `gae_lambda: 0.95`, `gamma: 0.99`; optional `ent_coef` (legacy profiles retain zero). Learning rate in (0,1], entropy in [0,1], integer batch size one of 64/128/256/512; separate 128x128 policy/value networks stay fixed |
@@ -412,9 +412,18 @@ are rejected, not silently upgraded.
 
 ### Execution and report semantics
 
-Every partition receives isolated warm-up, tick-quantized EMA features lagged
-one bar, and a standard scaler fitted only on active training rows (population
-variance; zero-variance scale explicitly set to one). All seed workers receive
+Every partition receives isolated warm-up of `max(warmup_bars, k × slow)` bars
+and is enriched by `engine_rl.alpha_pipeline.attach_alpha`: the hash-verified
+alpha manifest's feature windows, its frozen training-partition Z-score (never
+refitted on RL data), and the ONNX graph scored in float32 produce
+`alpha_prediction` plus 8 Z-scored features (lagged one closed bar) and
+`spread_fraction`. Every active row must receive a complete finite observation,
+or the run is refused. `TradingEnvAdapter` locks environments to those 10
+columns plus `position_side`/`unrealized_pnl_fraction` (12 inputs). The alpha
+manifest records its training window and label horizon; the run is refused
+unless the last alpha label bar is strictly before the RL train split, so
+PPO never trains on in-sample alpha. Lagged tick-quantized EMAs are computed only
+for the fixed baseline. All seed workers receive
 train/validation frames only during training, never test frames or a mutable
 source file. Each seed freezes its predeclared final checkpoint, records
 validation metrics without tuning on them, and saves a SHA-256-identified ZIP.
@@ -433,7 +442,7 @@ Missing/failed/undefined seed metrics cannot be dropped from aggregation.
 `reports/offline_audit_report.json` is atomically replaced, with an additional
 per-run `reports/runs/<id>/audit.json` and config/data snapshots. The report
 includes exact raw-byte `config_hash`/`dataset_hash`, split and gap evidence,
-scaler parameters, configured/completed/missing seeds, per-seed evidence,
+alpha provenance (manifest/ONNX SHA-256, training window, label end), per-seed evidence,
 componentwise median PF/Sharpe/drawdown, thresholds, and explicit failure
 reasons. Undefined metrics are `null` with reasons. **`threshold_pass` and `pass`
 require every seed and all frozen research gates; `decision` is PASS or FAIL.**
@@ -455,13 +464,25 @@ object with exactly these keys:
 
 ```json
 {
-  "source_path": "strategy.mq5",
+  "source_path": "EA_Template.mq5",
   "source_sha256": "<exact SHA-256 of original source bytes>",
   "metaeditor_path": "C:\\Path\\To\\metaeditor64.exe",
-  "parameters": {"InpFast": 8, "InpSlow": 21},
-  "parameter_binding": "fixed_strategy_parameters_not_ppo_policy"
+  "parameters": {},
+  "parameter_binding": "linear_ppo_policy_with_alpha_zscore_v1",
+  "policy_seed": 42
 }
 ```
+
+`policy_seed` must be one of the predeclared training seeds (chosen before
+results, not the best OOS seed). The gate re-hashes that seed's frozen model,
+requires `policy_architecture: "linear_actor"`, loads it on CPU, and extracts
+`action_net.weight`/`bias` as `PPO_WEIGHTS[3][12]`/`PPO_BIAS[3]`. It re-verifies
+the alpha manifest and ONNX hashes against the evaluated run, then injects
+`InpAlphaMean0..7`/`InpAlphaStd0..7` and the seven feature-window inputs. Config
+`parameters` may only add scalar anchored inputs; matrices, or any name the
+gate generates, are refused, so policy and alpha values can only come from
+verified artifacts. `InpModelFile` is not patched: the outcome records
+`required_onnx_file` and `alpha_onnx_sha256`, which the operator must install.
 
 Paths resolve relative to the experiment config. Run
 `python orchestrator.py path\to\frozen-ppo-config.json --deploy`.
@@ -486,9 +507,9 @@ the original**, preserving relative includes. Only a clean zero-warning build
 resets a non-suspended failure counter. Errors return build status `INVALID`,
 delete the staged binary, and attempt an alert without crashing the pipeline.
 Original source/binary remain unchanged. Successful status is
-`STAGED_BUILD_SUCCEEDED`, **not live deployment**: patching EMA inputs does not
-export a PPO policy or prove equivalent MT5 performance. The explicit binding
-acknowledgment prevents implying that such an export occurred. Compile/alert
+`STAGED_BUILD_SUCCEEDED` with `policy_exported: true`, **not live deployment**:
+a clean build does not prove equivalent MT5 performance (the EA only logs
+decisions). Compile/alert
 results are separate from data readiness and research PASS; opt-in CLI runs
 exit nonzero unless the staged build succeeds.
 Run tests with `python -m pytest tests\test_orchestrator.py tests\test_deployment_gate.py -q`.
@@ -624,13 +645,11 @@ restarting the process or bit-identical native-library training.
 | PPO learning rate | Log-uniform [0.00001, 0.001] |
 | PPO entropy coefficient | Log-uniform [0.0001, 0.03] |
 | PPO batch size | Categorical 64, 128, 256, 512 |
-| EMA fast period | Integer [2, 16] |
-| EMA slow period | Integer [17, 64] |
 
-The disjoint EMA domains enforce fast < slow. Warm-up is recomputed as
-`k_multiplier * sampled_slow_period`; provide enough history for the largest
-lookback, or those trials are explicitly pruned. Every trial runs all configured
-seeds, with a new train-only scaler and the normal all-model freeze barrier.
+Search-space version 2 removed EMA sampling: EMAs now drive only the baseline,
+and alpha windows are frozen in the hash-locked manifest (its path is resolved
+to absolute for trial copies). Every trial runs all configured
+seeds with the manifest Z-score and the normal all-model freeze barrier.
 Objective value is the **median Profit Factor**, recomputed from every seed and
 checked against the audit. Low finite performance remains useful to TPE.
 Failed validation, crashed workers, missing/duplicate seeds, or undefined PF
@@ -770,12 +789,13 @@ of 0 makes an unpatched EA return `INIT_FAILED`, as does a missing ONNX model or
 non-finite weights. `#property strict` (an MQL4 directive that would warn under
 the zero-warning gate) is omitted.
 
-Limitations: the EA only logs decisions and never sends orders. The governed
-orchestrator still trains on two EMA features, so its policies are not 12-dim
-and cannot be exported; no governed pipeline builds the 12-dim contract
-environment from real data. `TradingEnv` unrealized PnL includes exit slippage
+Limitations: the EA only logs decisions and never sends orders. The orchestrator
+now trains on this 12-dim contract and `--deploy` injects the trained head.
+Python EWM indicators seed over `warmup_bars` per partition while the EA seeds
+over `InpWarmupBars`; use long warm-ups so seeding differences decay.
+`TradingEnv` unrealized PnL includes exit slippage
 and commission, while MT5 `POSITION_PROFIT` does not; SB3 float32 versus MQL5
-double could differ at near-ties. The `--deploy` gate refuses matrix parameters.
+double could differ at near-ties.
 Deep MLP policies should be exported via ONNX instead of matrix patching.
 Includes are relative (`../include/`). This EA has never been compiled with
 MetaEditor. Tests: `python -m pytest tests\test_ea_template.py -q`.

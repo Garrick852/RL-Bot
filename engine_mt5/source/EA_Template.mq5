@@ -81,13 +81,13 @@ input int    InpWarmupBars        = 500;              // closed bars per evaluat
 input long   InpMagic             = 852;              // identifies this strategy's positions
 
 input group "Feature windows (must equal xgb_alpha.manifest.json feature_engineer)"
-input int    InpRsiWindow  = 14;
-input int    InpMacdFast   = 12;
-input int    InpMacdSlow   = 26;
-input int    InpMacdSignal = 9;
-input int    InpAtrWindow  = 14;
-input int    InpBBWindow   = 20;
-input int    InpPAWindow   = 20;
+input int    InpRsiWindow  = 14; // OPTIMIZED:InpRsiWindow
+input int    InpMacdFast   = 12; // OPTIMIZED:InpMacdFast
+input int    InpMacdSlow   = 26; // OPTIMIZED:InpMacdSlow
+input int    InpMacdSignal = 9; // OPTIMIZED:InpMacdSignal
+input int    InpAtrWindow  = 14; // OPTIMIZED:InpAtrWindow
+input int    InpBBWindow   = 20; // OPTIMIZED:InpBBWindow
+input int    InpPAWindow   = 20; // OPTIMIZED:InpPAWindow
 
 //--- MQL5 forbids array-typed inputs, so the Z-score vectors are one
 //--- scalar per feature (FEATURE_NAMES order) and are copied into arrays

@@ -17,6 +17,8 @@ import pandas as pd
 
 from orchestrator import OfflineOrchestrator, _evaluate, main
 from governance.validator import ValidationState
+from engine_rl.linear_policy import MARKET_OBSERVATION_COLUMNS
+from alpha_fixtures import install_alpha, make_bars
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,14 +30,10 @@ class OrchestratorTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.path = self.root / "experiment.json"
         self.reports = self.root / "reports"
-        times = pd.date_range("2024-01-01", periods=230, freq="min", tz="UTC")
-        midpoint = 100 + np.sin(np.arange(230) / 3)
-        self.frame = pd.DataFrame({
-            "timestamp": times, "open": midpoint, "high": midpoint + 1,
-            "low": midpoint - 1, "close": midpoint, "volume": np.ones(230),
-            "bid": midpoint - .01, "ask": midpoint + .01,
-        })
+        self.frame = make_bars()
+        times = self.frame["timestamp"]
         self.frame.to_csv(self.root / "bars.csv", index=False)
+        manifest_name, manifest_sha = install_alpha(self.root)
         config = json.loads((ROOT / "config" / "offline_experiment.template.json").read_text("utf-8"))
         # Fill every informational field explicitly for this synthetic test only.
         def fill(value):
@@ -54,7 +52,8 @@ class OrchestratorTests(unittest.TestCase):
         self.config["strategy"]["ema"] = {
             "fast_period": 2, "slow_period": 3, "initialization_rule": "first_close_quantized",
         }
-        for name, start, end in (("train", 10, 70), ("validation", 70, 110), ("test", 110, 230)):
+        # RL partitions start after the alpha's last training label (row 149).
+        for name, start, end in (("train", 170, 230), ("validation", 230, 270), ("test", 270, 390)):
             self.config["splits"][name] = {
                 "start": (times[0] + pd.Timedelta(minutes=start)).isoformat(),
                 "end": (times[0] + pd.Timedelta(minutes=end)).isoformat(),
@@ -75,7 +74,7 @@ class OrchestratorTests(unittest.TestCase):
             },
         )
         self.config["features"].update(
-            ordered_names=["ema_fast", "ema_slow"], warmup_bars=6, scaler_method="standard",
+            alpha_manifest_path=manifest_name, alpha_manifest_sha256=manifest_sha, warmup_bars=20,
         )
         self.config["policy"].update(
             discrete_action_index_to_target={"0": -1, "1": 0, "2": 1}, action_space_type="discrete",
@@ -198,15 +197,15 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_deterministic_evaluation_reports_undefined_no_trade_metrics(self):
         frame = self.frame.iloc[:1].copy()
-        frame["ema_fast"], frame["ema_slow"] = 0., 0.
-        settings = dict(feature_columns=["ema_fast", "ema_slow"], initial_cash=10000,
+        frame[list(MARKET_OBSERVATION_COLUMNS)] = 0.
+        settings = dict(initial_cash=10000,
                         quantity=1, point_value=1, slippage=0, commission=0, lambda_term=0)
         first = _evaluate(7, frame, settings, 252, baseline="buy_and_hold")
         self.assertEqual(first, _evaluate(7, frame, settings, 252, baseline="buy_and_hold"))
         self.assertIsNone(first["metrics"]["profit_factor"])
         self.assertIsNone(first["metrics"]["sharpe"])
         frame = self.frame.iloc[:40].copy()
-        frame["ema_fast"], frame["ema_slow"] = 0., 0.
+        frame[list(MARKET_OBSERVATION_COLUMNS)] = 0.
         measured = _evaluate(42, frame, settings, 252, baseline="buy_and_hold")
         self.assertEqual(measured, _evaluate(42, frame, settings, 252, baseline="buy_and_hold"))
         self.assertGreater(measured["metrics"]["trade_count"], 0)
@@ -294,13 +293,16 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(policy_architecture, self.config["training"]["policy_architecture"])
             self.assertEqual(hyperparameters, self.config["training"]["ppo_hyperparameters"])
             self.assertLess(train_frame["timestamp"].max(), validation["timestamp"].min())
-            self.assertLess(validation["timestamp"].max(), self.frame["timestamp"].iloc[110])
+            self.assertLess(validation["timestamp"].max(), self.frame["timestamp"].iloc[270])
+            for frame in (train_frame, validation):
+                self.assertEqual(list(frame.index), list(range(len(frame))))
+                self.assertTrue(np.isfinite(frame[list(MARKET_OBSERVATION_COLUMNS)].to_numpy()).all())
             completed_training.append(seed)
             return {"seed": seed, "model_path": model_path, "actual_timesteps": 2048}
 
         def evaluate(frozen, test, _settings, _annualization):
             self.assertEqual(set(completed_training), {7, 42, 99})
-            self.assertEqual(test["timestamp"].min(), self.frame["timestamp"].iloc[110])
+            self.assertEqual(test["timestamp"].min(), self.frame["timestamp"].iloc[270])
             evaluated.append(frozen["seed"])
             return {
                 "seed": frozen["seed"], "status": "COMPLETE", "training": frozen,
@@ -338,6 +340,97 @@ class OrchestratorTests(unittest.TestCase):
                 report = OfflineOrchestrator(self.reports).run_pipeline(self.path, deploy=True)
         gate.assert_not_called()
         self.assertEqual(report["deployment"]["status"], "BLOCKED_INCOMPLETE")
+
+    def test_end_to_end_deploy_injects_trained_seed_policy_and_alpha(self):
+        from test_ea_template import TEMPLATE, parse_matrix, parse_vector
+        from engine_rl.linear_policy import export_linear_policy
+        from orchestrator import POLICY_PARAMETER_BINDING
+        from stable_baselines3 import PPO
+
+        source = self.root / "EA.mq5"
+        source.write_bytes(TEMPLATE.read_bytes())
+        self.config["deployment"] = {
+            "source_path": source.name, "metaeditor_path": "metaeditor64.exe",
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "parameters": {}, "parameter_binding": POLICY_PARAMETER_BINDING, "policy_seed": 42,
+        }
+        self.save()
+        orchestrator = OfflineOrchestrator(self.reports)
+        report = orchestrator.run_pipeline(self.path)
+        self.assertEqual(report["run_status"], "COMPLETE", report["errors"])
+        # Real research gates fail on synthetic data; force PASS only to reach the build step.
+        report["pass"] = True
+        orchestrator.context["deployment"] = {"requested": True}
+
+        def compile_fixture(_compiler, staged):
+            staged = Path(staged)
+            staged.with_suffix(".ex5").write_bytes(b"binary")
+            log = staged.with_suffix(".log")
+            log.write_text("0 error(s), 0 warning(s)")
+            return log
+
+        with patch("engine_mt5.patcher.MQL5Patcher.compile_ea", side_effect=compile_fixture), \
+             patch("governance.telegram_notifier.TelegramAlertEngine"):
+            outcome = orchestrator.execute_deployment_gate(report)
+        self.assertEqual(outcome["status"], "STAGED_BUILD_SUCCEEDED", outcome.get("reason"))
+        row = next(row for row in report["results"] if row["seed"] == 42)
+        expected = export_linear_policy(PPO.load(row["training"]["model_path"], device="cpu"))
+        staged = Path(outcome["staged_source"]).read_text()
+        np.testing.assert_array_equal(parse_matrix(staged, "PPO_WEIGHTS"), np.asarray(expected["PPO_WEIGHTS"]))
+        np.testing.assert_array_equal(parse_vector(staged, "PPO_BIAS"), np.asarray(expected["PPO_BIAS"]))
+        self.assertEqual(outcome["policy_model_sha256"], row["training"]["model_sha256"])
+        self.assertEqual(source.read_bytes(), TEMPLATE.read_bytes())
+
+    def run_alpha_refusal(self, message):
+        with patch("orchestrator.ProcessPoolExecutor") as pool:
+            with self.assertLogs("orchestrator", logging.ERROR):
+                report = OfflineOrchestrator(self.reports).run_pipeline(self.path)
+            pool.assert_not_called()
+        self.assertEqual(report["run_status"], "NOT_STARTED")
+        self.assertEqual(report["validation_state"], "INVALID")
+        self.assertFalse(report["pass"])
+        self.assertIn(message, " ".join(report["errors"]))
+
+    def test_alpha_in_sample_overlap_with_rl_train_split_is_refused(self):
+        # Row 149 is the last bar any alpha label observed; RL may not train on it.
+        self.config["splits"]["train"]["start"] = self.frame["timestamp"].iloc[149].isoformat()
+        self.save()
+        self.run_alpha_refusal("alpha training labels reach")
+
+    def test_insufficient_alpha_warmup_is_refused(self):
+        self.config["features"]["warmup_bars"] = 3
+        self.save()
+        self.run_alpha_refusal("warmup_bars cannot produce a complete alpha observation")
+
+    def test_tampered_alpha_artifacts_are_refused(self):
+        onnx = self.root / "xgb_alpha.onnx"
+        onnx.write_bytes(onnx.read_bytes() + b"\0")
+        self.run_alpha_refusal("ONNX artifact does not match")
+        self.config["features"]["alpha_manifest_sha256"] = "0" * 64
+        self.save()
+        self.run_alpha_refusal("alpha manifest SHA-256 mismatch")
+
+    def test_legacy_ema_observation_profile_is_refused(self):
+        self.config["features"]["ordered_names"] = ["ema_fast", "ema_slow"]
+        self.save()
+        with patch("orchestrator.ProcessPoolExecutor") as pool:
+            report = self.run_failure()
+            pool.assert_not_called()
+        self.assertIn("alpha_linear_policy_12x3_v1", " ".join(report["errors"]))
+
+    def test_alpha_observations_use_manifest_artifacts_and_lag_one_bar(self):
+        from engine_rl.alpha_pipeline import attach_alpha, load_alpha_model
+        alpha = load_alpha_model(self.root / "xgb_alpha.manifest.json",
+                                 self.config["features"]["alpha_manifest_sha256"])
+        enriched = attach_alpha(self.frame, alpha)
+        features = alpha.zscore.transform(alpha.engineer.generate_features(self.frame).reset_index(drop=True))
+        row = enriched.index[5]
+        expected = alpha.runtime().predict(features.loc[[row - 1]].to_numpy(np.float32))[0]
+        self.assertAlmostEqual(enriched.loc[row, "alpha_prediction"], float(expected), places=6)
+        np.testing.assert_allclose(
+            enriched.loc[row, list(MARKET_OBSERVATION_COLUMNS[1:9])].to_numpy(float),
+            features.loc[row - 1].to_numpy(float),
+        )
 
 
 if __name__ == "__main__":

@@ -60,11 +60,17 @@
     "reward_definition": null
   },
   "features": {
-    "ordered_names": null,
-    "indicator_parameters": null,
+    "observation_contract": "alpha_linear_policy_12x3_v1",
+    "ordered_names": [
+      "alpha_prediction", "z_rsi", "z_macd", "z_macd_signal", "z_macd_histogram", "z_atr",
+      "z_bollinger_width", "z_distance_from_rolling_high", "z_distance_from_rolling_low", "spread_fraction",
+      "position_side", "unrealized_pnl_fraction"
+    ],
+    "alpha_manifest_path": null,
+    "alpha_manifest_sha256": null,
     "warmup_bars": null,
-    "scaler_method": null,
-    "scaler_fit_partition": "train_only",
+    "scaler_method": "alpha_manifest_zscore",
+    "scaler_fit_partition": "alpha_training_partition",
     "refit_on_validation_or_test": false
   },
   "execution": {

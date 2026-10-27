@@ -175,6 +175,11 @@ def export_xgb_alpha_onnx(
         raise OnnxExportError("feature_engineer windows do not match the certified X_train")
     if fit_zscore(X_train) != zscore:
         raise OnnxExportError("X_train is not the partition the model's Z-score was fitted on")
+    horizon = getattr(model, "horizon", None)
+    if not isinstance(X_train.index, pd.DatetimeIndex) or X_train.index.tz is None:
+        raise OnnxExportError("X_train must keep its tz-aware timestamp index for leakage evidence")
+    if type(horizon) is not int or horizon < 1:
+        raise OnnxExportError("model must declare its positive integer label horizon")
     booster = booster_model.get_booster()
     if tuple(booster.feature_names or ()) != zscore.feature_names:
         raise OnnxExportError(
@@ -226,6 +231,12 @@ def export_xgb_alpha_onnx(
         "zscore": {**asdict(zscore), "ddof": ZSCORE_DDOF, "source": "training_partition"},
         "feature_engineer": feature_engineer_params(engineer),
         "training_rows": int(len(X_train)),
+        # Consumers must keep RL partitions after the last label bar (last + horizon bars).
+        "training_window": {
+            "first_feature_timestamp": X_train.index[0].tz_convert("UTC").isoformat(),
+            "last_feature_timestamp": X_train.index[-1].tz_convert("UTC").isoformat(),
+            "label_horizon_bars": horizon,
+        },
         "xgb_onnx_max_abs_difference": max_difference,
         "xgb_onnx_equivalence_atol": equivalence_atol,
         "versions": {"xgboost": xgboost.__version__, "onnxruntime": onnxruntime.__version__},

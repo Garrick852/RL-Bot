@@ -32,10 +32,9 @@ STORAGE_URL = "sqlite:///reports/optuna_vps_study.db"
 STUDY_NAME = "offline_ppo_vps"
 SAMPLER_SEED = 852
 SEARCH_SPACE = {
-    "version": 1, "metric": "median_profit_factor", "sampler_seed": SAMPLER_SEED,
+    "version": 2, "metric": "median_profit_factor", "sampler_seed": SAMPLER_SEED,
     "learning_rate": [1e-5, 1e-3], "ent_coef": [1e-4, 3e-2],
     "batch_size": [64, 128, 256, 512],
-    "ema_fast_period": [2, 16], "ema_slow_period": [17, 64],
 }
 
 
@@ -84,6 +83,9 @@ class OfflineOptimizer:
         self.base_config["dataset"]["path"] = str(
             _local_path(base["dataset"]["path"], source.parent).resolve()
         )
+        self.base_config["features"]["alpha_manifest_path"] = str(
+            _local_path(base["features"]["alpha_manifest_path"], source.parent).resolve()
+        )
         # Operational configuration is irrelevant to a search candidate.
         self.base_config.pop("deployment", None)
         self.base_config["orchestration"]["max_workers"] = min(
@@ -114,12 +116,7 @@ class OfflineOptimizer:
             parameters["learning_rate"] = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
             parameters["ent_coef"] = trial.suggest_float("ent_coef", 1e-4, 3e-2, log=True)
             parameters["batch_size"] = trial.suggest_categorical("batch_size", [64, 128, 256, 512])
-            ema = config["strategy"]["ema"]
-            ema["fast_period"] = trial.suggest_int("ema_fast_period", 2, 16)
-            ema["slow_period"] = trial.suggest_int("ema_slow_period", 17, 64)
-            config["features"]["warmup_bars"] = (
-                config["orchestration"]["k_multiplier"] * ema["slow_period"]
-            )
+            # Alpha windows are frozen in the hash-locked manifest; EMAs only drive the baseline.
             directory = self.reports / "optuna_trials" / f"trial-{trial.number}-{uuid.uuid4().hex}"
             config_path = directory / "trial_config.json"
             _atomic_json(config_path, config)

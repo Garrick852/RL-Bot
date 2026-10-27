@@ -20,6 +20,8 @@ from typing import Any, Optional, Sequence
 from governance.validator import ConfigValidator, ValidationState
 
 LOGGER = logging.getLogger(__name__)
+# Deploy binding: linear PPO head (3x12 + bias) plus the alpha manifest Z-score and windows.
+POLICY_PARAMETER_BINDING = "linear_ppo_policy_with_alpha_zscore_v1"
 
 
 class PipelineError(ValueError):
@@ -108,9 +110,9 @@ def _evaluate(
 ) -> dict[str, Any]:
     """Measure a frozen deterministic policy or fixed baseline on one partition."""
     import numpy as np
-    from engine_rl.envs.trading_env import TradingEnv
+    from engine_rl.alpha_pipeline import TradingEnvAdapter
 
-    env = TradingEnv(active, **env_settings)
+    env = TradingEnvAdapter(active, **env_settings)
     observation, _ = env.reset(seed=seed)
     equity = [env.initial_cash]
     for index in range(len(active)):
@@ -172,11 +174,11 @@ def _train_seed(
 ) -> dict[str, Any]:
     """Train without receiving test data; freeze the final predeclared checkpoint."""
     from engine_rl.sb3_trainer import SB3Trainer
-    from engine_rl.envs.trading_env import TradingEnv
+    from engine_rl.alpha_pipeline import TradingEnvAdapter
 
     trainer = SB3Trainer(seed=seed, num_threads=1, hyperparameters=hyperparameters,
                          policy_architecture=policy_architecture)
-    model = trainer.train(TradingEnv(train, **settings), budget)
+    model = trainer.train(TradingEnvAdapter(train, **settings), budget)
     validation_result = _evaluate(seed, validation, settings, annualization, model=model)
     model.save(model_path)
     digest = hashlib.sha256(Path(model_path).read_bytes()).hexdigest()
@@ -300,49 +302,63 @@ class OfflineOrchestrator:
             }
             partitions = {}
             partition_evidence = {}
+            from engine_rl.alpha_pipeline import alpha_label_end, attach_alpha, load_alpha_model
+            from engine_rl.linear_policy import MARKET_OBSERVATION_COLUMNS
+            features_config = config["features"]
+            alpha = load_alpha_model(
+                _local_path(features_config["alpha_manifest_path"], path.parent),
+                features_config["alpha_manifest_sha256"],
+            )
+            label_end = alpha_label_end(frame["timestamp"], alpha)
+            # Alpha labels must end before the first RL-trained row, so RL never sees in-sample alpha.
+            _require(label_end < pd.Timestamp(config["splits"]["train"]["start"]),
+                     f"alpha training labels reach {label_end.isoformat()}, not before the RL train split")
             fast = config["strategy"]["ema"]["fast_period"]
             slow = config["strategy"]["ema"]["slow_period"]
+            history = max(features_config["warmup_bars"], run["k_multiplier"] * slow)
             for name in ("train", "validation", "test"):
                 bounds = config["splits"][name]
                 _require(pd.Timestamp(bounds["start"]) >= frame["timestamp"].iloc[0]
                          and pd.Timestamp(bounds["end"]) <= frame["timestamp"].iloc[-1] + pd.Timedelta(config["dataset"]["timeframe"]),
                          f"dataset does not cover {name} boundaries")
-                warmup, active = collector.get_split(
-                    frame, bounds["start"], bounds["end"], run["k_multiplier"], slow
-                )
+                warmup, active = collector.get_split(frame, bounds["start"], bounds["end"], 1, history)
                 combined = pd.concat([warmup, active], ignore_index=True)
-                for period, feature in ((fast, "ema_fast"), (slow, "ema_slow")):
-                    # Lag close-based indicators so row-t fills cannot use row-t close.
+                # EMAs feed only the fixed_ema_crossover baseline, never the policy observation.
+                baseline = {}
+                for period, feature in ((fast, "fast"), (slow, "slow")):
                     values = collector.calculate_ema(
                         combined, period, config["instrument"]["tick_size"]
                     ).shift(1)
-                    active[feature] = values.iloc[len(warmup):].to_numpy()
+                    baseline[feature] = values.iloc[len(warmup):].to_numpy()
+                enriched = attach_alpha(combined, alpha)
+                enriched = enriched.loc[enriched.index >= len(warmup)]
+                _require(len(enriched) == len(active),
+                         f"{name}: warmup_bars cannot produce a complete alpha observation for every active row")
+                active = enriched.reset_index(drop=True)
                 active["baseline_target"] = (
-                    (active["ema_fast"] > active["ema_slow"]).astype(int)
-                    - (active["ema_fast"] < active["ema_slow"]).astype(int)
+                    (baseline["fast"] > baseline["slow"]).astype(int)
+                    - (baseline["fast"] < baseline["slow"]).astype(int)
                 )
+                observation = active[list(MARKET_OBSERVATION_COLUMNS)].to_numpy()
+                _require(np.isfinite(observation).all()
+                         and (np.abs(observation) <= np.finfo(np.float32).max).all(),
+                         f"{name}: observations must be finite and float32 representable")
                 partitions[name] = active
                 partition_evidence[name] = {
                     "rows": len(active), "warmup_rows": len(warmup),
                     "first_scored": active["timestamp"].iloc[0].isoformat(),
                     "last_scored": active["timestamp"].iloc[-1].isoformat(),
                 }
-            features = config["features"]["ordered_names"]
-            train = partitions["train"][features]
-            mean = train.mean()
-            scale = train.std(ddof=0)
-            # This is a declared standard-scaler zero-variance rule, not missing data padding.
-            scale = scale.mask(scale == 0, 1.0)
-            _require(np.isfinite(mean.to_numpy()).all() and np.isfinite(scale.to_numpy()).all(),
-                     "training scaler statistics must be finite")
-            for active in partitions.values():
-                active[features] = (active[features] - mean) / scale
-                values = active[features].to_numpy()
-                _require(np.isfinite(values).all() and (np.abs(values) <= np.finfo(np.float32).max).all(),
-                         "scaled features must be finite and float32 representable")
+            self.context["alpha"] = {
+                "observation_contract": features_config["observation_contract"],
+                "manifest_sha256": alpha.manifest_sha256, "onnx_sha256": alpha.onnx_sha256,
+                "training_window": dict(alpha.training_window),
+                "label_end": label_end.isoformat(),
+                "feature_engineer": dict(alpha.manifest["feature_engineer"]),
+            }
             self.context["scaler"] = {
-                "fit_partition": "train_only", "mean": mean.to_dict(), "scale": scale.to_dict(),
-                "zero_variance_rule": "unit_scale", "feature_order": features,
+                "fit_partition": "alpha_training_partition", "method": "alpha_manifest_zscore",
+                "refit_on_rl_partitions": False, "feature_order": list(alpha.zscore.feature_names),
             }
             self.context["partition_evidence"] = partition_evidence
             self.context["splits"] = config["splits"]
@@ -427,7 +443,6 @@ class OfflineOrchestrator:
     def _env_settings(self) -> dict[str, Any]:
         config = self.config
         return {
-            "feature_columns": config["features"]["ordered_names"],
             "initial_cash": config["instrument"]["starting_cash"],
             "quantity": config["orchestration"]["quantity"],
             "point_value": config["instrument"]["point_value_per_unit"],
@@ -484,14 +499,28 @@ class OfflineOrchestrator:
         _require(config["strategy"]["name"] == "fixed_ema_crossover"
                  and config["strategy"]["ema"]["initialization_rule"] == "first_close_quantized",
                  "only first_close_quantized EMA features are supported")
-        _require(config["features"]["ordered_names"] == ["ema_fast", "ema_slow"]
-                 and config["features"]["scaler_method"] == "standard"
-                 and config["features"]["scaler_fit_partition"] == "train_only"
-                 and config["features"]["refit_on_validation_or_test"] is False,
-                 "features require ordered lagged EMA fast/slow with train-only standard scaling")
-        _require(config["features"]["warmup_bars"] == run["k_multiplier"] * config["strategy"]["ema"]["slow_period"],
-                 "features.warmup_bars must equal k_multiplier * slow_period")
-        _require(type(config["features"]["warmup_bars"]) is int, "warmup_bars must be an integer")
+        features = config["features"]
+        from engine_rl.alpha_pipeline import OBSERVATION_CONTRACT
+        from engine_rl.linear_policy import OBSERVATION_NAMES
+        expected_features = {
+            "observation_contract", "ordered_names", "alpha_manifest_path", "alpha_manifest_sha256",
+            "warmup_bars", "scaler_method", "scaler_fit_partition", "refit_on_validation_or_test",
+        }
+        _require(isinstance(features, dict) and set(features) == expected_features,
+                 f"features requires exactly {sorted(expected_features)}")
+        _require(features["observation_contract"] == OBSERVATION_CONTRACT
+                 and features["ordered_names"] == list(OBSERVATION_NAMES)
+                 and features["scaler_method"] == "alpha_manifest_zscore"
+                 and features["scaler_fit_partition"] == "alpha_training_partition"
+                 and features["refit_on_validation_or_test"] is False,
+                 f"features require the {OBSERVATION_CONTRACT} 12-input observation with the alpha manifest Z-score")
+        _require(isinstance(features["alpha_manifest_path"], str) and bool(features["alpha_manifest_path"]),
+                 "features.alpha_manifest_path must be a nonempty path")
+        _require(isinstance(features["alpha_manifest_sha256"], str)
+                 and len(features["alpha_manifest_sha256"]) == 64
+                 and all(char in "0123456789abcdef" for char in features["alpha_manifest_sha256"]),
+                 "features.alpha_manifest_sha256 must be a lowercase SHA-256")
+        _integer(features["warmup_bars"], "warmup_bars")
         mapping = config["policy"]["discrete_action_index_to_target"]
         _require(mapping == {"0": -1, "1": 0, "2": 1}
                  and all(type(value) is int for value in mapping.values())
@@ -640,9 +669,12 @@ class OfflineOrchestrator:
         """Opt-in staged build only; never load a terminal or install a policy.
 
         Research readiness, research PASS, and local build status are separate.
-        A PPO action policy is not equivalent to tagged EMA parameters: this
-        gate explicitly requires the fixed-parameter-only binding contract.
-        The original source and its binary remain unchanged.
+        The staged EA receives the predeclared seed's linear PPO head
+        (``action_net`` weights/bias, re-loaded from its hash-verified model) and
+        the alpha manifest's Z-score and feature windows. Policy and alpha values
+        come only from verified artifacts; config ``parameters`` may add scalars
+        but can never supply or override them. The original source and its
+        binary remain unchanged.
         """
         outcome: dict[str, Any] = {"requested": False, "status": "BLOCKED_NOT_AUTHORIZED"}
         if self.context.get("deployment", {}).get("requested") is not True:
@@ -667,11 +699,17 @@ class OfflineOrchestrator:
                      "only completed real PPO OOS results can enter the build gate")
             _require("optimization" not in self.config, "search candidates require fresh holdout evaluation")
             deployment = self.config["deployment"]
-            required = {"source_path", "source_sha256", "metaeditor_path", "parameters", "parameter_binding"}
+            required = {
+                "source_path", "source_sha256", "metaeditor_path", "parameters",
+                "parameter_binding", "policy_seed",
+            }
             _require(isinstance(deployment, dict) and set(deployment) == required,
                      f"deployment requires exactly {sorted(required)}")
-            _require(deployment["parameter_binding"] == "fixed_strategy_parameters_not_ppo_policy",
-                     "MQL5 policy export is unimplemented; explicit fixed-parameter-only binding required")
+            _require(deployment["parameter_binding"] == POLICY_PARAMETER_BINDING,
+                     f"deployment.parameter_binding must be {POLICY_PARAMETER_BINDING}")
+            policy_seed = deployment["policy_seed"]
+            _require(type(policy_seed) is int and policy_seed in self.config["training"]["seeds"],
+                     "deployment.policy_seed must be one of the predeclared training seeds")
             source = _local_path(deployment["source_path"], self._config_base).absolute()
             compiler = _local_path(deployment["metaeditor_path"], self._config_base).absolute()
             # Persistent state is keyed to the asset/source, not the current run.
@@ -720,27 +758,31 @@ class OfflineOrchestrator:
             _require(hashlib.sha256(source_bytes).hexdigest() == deployment["source_sha256"],
                      "MQL5 source identity mismatch")
             parameters = deployment["parameters"]
-            _require(isinstance(parameters, dict) and bool(parameters), "explicit MQL5 parameter mapping required")
+            _require(isinstance(parameters, dict), "deployment.parameters must be an explicit scalar mapping")
             _require(all(not isinstance(value, (list, tuple, dict)) for value in parameters.values()),
-                     "matrix/policy parameters are outside the fixed-parameter-only build gate")
+                     "matrix parameters may only come from the hash-verified PPO model, never from config")
+            generated = self._policy_build_parameters(report, policy_seed)
+            collisions = sorted(set(parameters) & set(generated["parameters"]))
+            _require(not collisions, f"config parameters may not override generated policy/alpha inputs: {collisions}")
+            build_parameters = {**parameters, **generated["parameters"]}
             staged = source.with_name(f"{source.stem}.{run_id}.staged.mq5")
             _require(not staged.exists(), "staged source already exists")
             with staged.open("xb") as destination:
                 destination.write(source_bytes)
             patcher = MQL5Patcher()
-            patcher.patch_source(staged, parameters)
+            patcher.patch_source(staged, build_parameters)
             log_path = patcher.compile_ea(compiler, staged)
-            # Never infer a deployed PPO policy from a clean fixed-parameter build.
             outcome.update(
                 status="STAGED_BUILD_SUCCEEDED", staged_source=str(staged),
                 staged_binary=str(staged.with_suffix(".ex5")), compile_log=str(log_path),
                 original_source_unchanged=True, live_deployment_performed=False,
-                policy_exported=False,
+                policy_exported=True, **generated["evidence"],
             )
             persisted["consecutive_failures"] = 0
             _atomic_json(state_path, persisted)
             outcome["notification_delivered"] = self._notify(
-                notifier.send_deployment_success, asset, report["median_oos_metrics"], parameters,
+                notifier.send_deployment_success, asset, report["median_oos_metrics"],
+                {**parameters, **generated["summary"]},
             )
             return outcome
         except Exception as exc:
@@ -763,6 +805,47 @@ class OfflineOrchestrator:
                 except OSError as exc:
                     outcome.update(status="INVALID", lock_cleanup_error=str(exc))
                     LOGGER.error("Build lock could not be released: %s", exc)
+
+    def _policy_build_parameters(self, report: dict[str, Any], policy_seed: int) -> dict[str, Any]:
+        """Export the selected seed's linear policy and the run's alpha inputs for patching."""
+        from engine_rl.alpha_pipeline import EA_WINDOW_INPUTS, load_alpha_model
+        from engine_rl.linear_policy import export_linear_policy
+        from models.onnx_bridge import mql5_zscore_inputs
+
+        rows = [row for row in report["results"] if row.get("seed") == policy_seed]
+        _require(len(rows) == 1, f"policy_seed {policy_seed} has no unique OOS result in this run")
+        training = rows[0]["training"]
+        _require(training.get("policy_architecture") == "linear_actor",
+                 "only a linear_actor PPO head maps onto the EA's 3x12 matrix")
+        model_path = Path(training["model_path"])
+        model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        _require(model_sha == training["model_sha256"], "frozen PPO model SHA-256 mismatch")
+        from stable_baselines3 import PPO
+
+        policy = export_linear_policy(PPO.load(str(model_path), device="cpu"))
+        features = self.config["features"]
+        alpha = load_alpha_model(
+            _local_path(features["alpha_manifest_path"], self._config_base),
+            features["alpha_manifest_sha256"],
+        )
+        run_alpha = self.context.get("alpha", {})
+        _require(alpha.onnx_sha256 == run_alpha.get("onnx_sha256")
+                 and alpha.manifest_sha256 == run_alpha.get("manifest_sha256"),
+                 "alpha artifacts changed after the evaluated run")
+        windows = {EA_WINDOW_INPUTS[name]: value for name, value in alpha.manifest["feature_engineer"].items()}
+        parameters = {**policy, **mql5_zscore_inputs(alpha.manifest), **windows}
+        return {
+            "parameters": parameters,
+            "summary": {"policy_seed": policy_seed, "policy_model_sha256": model_sha[:16],
+                        "alpha_onnx_sha256": alpha.onnx_sha256[:16]},
+            "evidence": {
+                "policy_seed": policy_seed, "policy_model_sha256": model_sha,
+                "alpha_manifest_sha256": alpha.manifest_sha256,
+                "alpha_onnx_sha256": alpha.onnx_sha256,
+                # InpModelFile is not patched: the operator must install exactly this file.
+                "required_onnx_file": alpha.onnx_path.name,
+            },
+        }
 
     @staticmethod
     def _notify(method: Any, *args: Any) -> bool:
