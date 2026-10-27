@@ -23,7 +23,7 @@ from optuna.trial import FrozenTrial, TrialState
 
 from governance.validator import ConfigValidator, ValidationState
 from orchestrator import (
-    OfflineOrchestrator, _atomic_json, _local_path, _reject_constant, _unique_object,
+    OfflineOrchestrator, _atomic_json, _local_path, _reject_constant, _root_relative, _unique_object,
     _worker_initializer,
 )
 
@@ -100,6 +100,8 @@ class OfflineOptimizer:
         if self.candidate_path == source:
             raise ValueError("candidate export must not overwrite the base experiment")
         self.reports = Path("reports").resolve()
+        # Repository root: run the optimizer from the repo root so artifacts relocate.
+        self.root = Path.cwd().resolve()
         self.contract = {
             "base_config_sha256": hashlib.sha256(raw).hexdigest(),
             "search_space": SEARCH_SPACE,
@@ -151,12 +153,22 @@ class OfflineOptimizer:
                 median, reported, rel_tol=0, abs_tol=1e-12,
             ):
                 raise ValueError("reported median does not match every configured seed")
-            # Hash-bound copy of the exact evidence (frozen model paths/SHAs) for holdout_eval.
+            # Hash-bound copy of the exact evidence (frozen model SHAs) for holdout_eval.
             evidence_path = directory / CANDIDATE_EVIDENCE_NAME
             _atomic_json(evidence_path, report)
-            trial.set_user_attr("trial_config_sha256", hashlib.sha256(config_path.read_bytes()).hexdigest())
-            trial.set_user_attr("evidence_path", str(evidence_path))
-            trial.set_user_attr("evidence_sha256", hashlib.sha256(evidence_path.read_bytes()).hexdigest())
+            by_seed = {row["seed"]: row["training"] for row in rows}
+            # Root-relative POSIX paths: a candidate found on a Linux VPS resolves in a Windows clone.
+            artifacts = {
+                "trial_config": {"path": _root_relative(config_path, self.root),
+                                 "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest()},
+                "evidence": {"path": _root_relative(evidence_path, self.root),
+                             "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest()},
+                "alpha_manifest": {"path": _root_relative(config["features"]["alpha_manifest_path"], self.root),
+                                   "sha256": config["features"]["alpha_manifest_sha256"]},
+                "models": [{"seed": seed, "path": _root_relative(by_seed[seed]["model_path"], self.root),
+                            "sha256": by_seed[seed]["model_sha256"]} for seed in seeds],
+            }
+            trial.set_user_attr("candidate_artifacts", artifacts)
             trial.set_user_attr("eligible_objective", True)
             return float(median)
         except optuna.TrialPruned:
@@ -181,20 +193,16 @@ class OfflineOptimizer:
             raise ValueError("best trial lacks verified multi-seed search evidence")
         if best.number == self._exported_best:
             return
-        missing = {"trial_config_path", "trial_config_sha256", "evidence_path", "evidence_sha256"} - set(
-            best.user_attrs
-        )
-        if missing:
-            raise ValueError(f"best trial lacks hash-bound candidate evidence: {sorted(missing)}")
+        artifacts = best.user_attrs.get("candidate_artifacts")
+        if not isinstance(artifacts, dict) or set(artifacts) != {"trial_config", "evidence", "alpha_manifest", "models"}:
+            raise ValueError("best trial lacks hash-bound, root-relative candidate artifacts")
         candidate = {
             "contract": CANDIDATE_CONTRACT,
             "trial_number": best.number,
             "objective": {"metric": "median_profit_factor", "value": best.value},
             "params": dict(best.params),
-            "trial_config_path": best.user_attrs["trial_config_path"],
-            "trial_config_sha256": best.user_attrs["trial_config_sha256"],
-            "evidence_path": best.user_attrs["evidence_path"],
-            "evidence_sha256": best.user_attrs["evidence_sha256"],
+            "path_anchor": "repository_root",
+            "artifacts": artifacts,
             # Predeclared before any holdout is seen; never derived from search results.
             "theta_accept": {
                 "metric": "median_profit_factor",

@@ -497,15 +497,31 @@ object with exactly these keys:
 ```
 
 `policy_seed` must be one of the predeclared training seeds (chosen before
-results, not the best OOS seed). The gate re-hashes that seed's frozen model,
-requires `policy_architecture: "linear_actor"`, loads it on CPU, and extracts
-`action_net.weight`/`bias` as `PPO_WEIGHTS[3][12]`/`PPO_BIAS[3]`. It re-verifies
+results, not the best OOS seed).
+
+**Holdout air-gap.** Before any lock, journal, patcher, or compiler work the
+gate loads `reports\true_holdout_eval.json` (override with `--holdout-report`;
+paths resolve against the repository root = cwd) and refuses with `INVALID`
+unless: `contract` is `true_holdout_eval_v1`; `accepted`, `evaluated_once`,
+`gap_ok`, and `reconciliation_ok` are all `true`; `median_oos >= theta_accept`;
+the burn flag named in the audit exists and its dataset/candidate SHAs match the
+audit; the audit's alpha manifest/ONNX SHAs equal the alpha being injected; and
+`policy_seed` has exactly one `COMPLETE` row whose root-relative `model_path`
+hashes to its recorded `model_sha256`. The gate then injects **that
+holdout-accepted frozen model**, never the deploy run's freshly retrained model
+(SB3 zips are not byte-reproducible, so a retrain could never match the audit).
+It re-hashes it before and after loading, proves a linear actor, and extracts
+`action_net.weight`/`bias` as `PPO_WEIGHTS[3][12]`/`PPO_BIAS[3]`. The outcome
+records `policy_source: holdout_accepted_frozen_model`, the holdout report SHA,
+median, threshold, and dataset/candidate SHAs. It re-verifies
 the alpha manifest and ONNX hashes against the evaluated run, then injects
 `InpAlphaMean0..7`/`InpAlphaStd0..7` and the seven feature-window inputs. Config
 `parameters` may only add scalar anchored inputs; matrices, or any name the
 gate generates, are refused, so policy and alpha values can only come from
 verified artifacts. `InpModelFile` is not patched: the outcome records
 `required_onnx_file` and `alpha_onnx_sha256`, which the operator must install.
+The deploy run's own research `pass` is still required; its PPO hyperparameters
+are not cross-checked against the candidate's trial config.
 
 Paths resolve relative to the experiment config. Run
 `python orchestrator.py path\to\frozen-ppo-config.json --deploy`.
@@ -687,13 +703,18 @@ process lock; after a hard kill, inspect the old process and lock before
 manually clearing a stale lock. Unfinished trials/artifacts remain evidence,
 not successful results. Thread limits do not replace VPS temperature monitoring.
 
-Each new eligible high-water mark atomically writes a **hash-bound holdout
-candidate** (`contract: holdout_candidate_v1`) to `config\best_candidate_config.json`:
-the sampled `params`, the trial config path and SHA-256, a persisted
-`candidate_evidence.json` (the trial's full audit, including frozen model paths
-and SHAs) path and SHA-256, and `theta_accept`, which is the predeclared
+Each new eligible high-water mark atomically writes a **hash-bound, relocatable
+holdout candidate** (`contract: holdout_candidate_v1`, `path_anchor:
+repository_root`) to `config\best_candidate_config.json`: the sampled `params`,
+`artifacts` (`trial_config`, `evidence` = the persisted `candidate_evidence.json`
+audit, `alpha_manifest`, and one `models` entry per predeclared seed), each a
+`{path, sha256}` pair whose path is a **POSIX path relative to the repository
+root**, and `theta_accept`, which is the predeclared
 `research_gate_thresholds.min_profit_factor` (never derived from search results).
-This is not a runnable active configuration. Resume repairs a missing export
+Run the optimizer from the repository root; a trial whose artifacts fall outside
+it is pruned. A candidate exported on a Linux VPS therefore resolves unchanged in
+a Windows clone once `reports\optuna_trials\...` and the alpha artifacts are
+copied alongside it. This is not a runnable active configuration. Resume repairs a missing export
 from the committed best trial. Trials always call `run_pipeline(..., deploy=False)`;
 no build work, notifications, or fallback-journal changes are requested.
 
@@ -718,8 +739,11 @@ Order of operations:
 1. Hash `--data`; a mismatch raises `ValueError` and burns nothing.
 2. Refuse with `HoldoutAlreadyUsedError` if `data\holdout_used.flag` or
    `reports\true_holdout_eval.json` already exists.
-3. Preflight without reading holdout contents: candidate contract, trial config,
-   evidence, every seed's frozen `linear_actor` model, and alpha manifest/ONNX
+3. Preflight without reading holdout contents: candidate contract, then every
+   root-relative artifact (paths with `\`, a leading `/`, `:`, or `..` are
+   refused; absolute paths embedded in the hashed trial config/evidence are never
+   dereferenced): trial config, evidence, each seed's frozen `linear_actor` model
+   (SHA must equal the evidence row), and alpha manifest/ONNX
    SHAs; profile validation; `theta_accept` not weaker than `min_profit_factor`;
    `--holdout-start` not before the end of every search split.
 4. Create the flag exclusively (`O_EXCL`, read-only). The holdout is now burned.
@@ -730,10 +754,17 @@ Order of operations:
 `reports\true_holdout_eval.json` always records `median_oos` (median Profit
 Factor across seeds, `null` if undefined), `reconciliation_ok`, `gap_ok`,
 `evaluated_once: true`, and `accepted` (`median_oos >= theta_accept` and every
-check true), plus dataset, schedule, candidate, and per-seed evidence. Failures
+check true), plus dataset, schedule, candidate, and per-seed evidence. The burn
+flag, candidate, and per-seed `model_path` are recorded root-relative. Failures
 after the burn are recorded, not retried. Exit codes: `0` accepted, `1` rejected
 or failed after the burn, `2` refused before the burn (or already burned).
-Acceptance is research evidence only; it does not run `--deploy`.
+Acceptance alone does not run `--deploy`, but `--deploy` cannot build without it.
+`reports\` is gitignored, so commit the audit and the burn flag explicitly to make
+the burn repository-wide:
+
+```powershell
+git add -f reports\true_holdout_eval.json data\holdout_used.flag
+```
 
 ## Milestone 3 workstream: adaptive fallback directives
 
@@ -848,7 +879,7 @@ non-finite weights. `#property strict` (an MQL4 directive that would warn under
 the zero-warning gate) is omitted.
 
 Limitations: the EA only logs decisions and never sends orders. The orchestrator
-now trains on this 12-dim contract and `--deploy` injects the trained head.
+now trains on this 12-dim contract and `--deploy` injects the holdout-accepted head.
 Python EWM indicators seed over `warmup_bars` per partition while the EA seeds
 over `InpWarmupBars`; use long warm-ups so seeding differences decay.
 `TradingEnv` unrealized PnL includes exit slippage

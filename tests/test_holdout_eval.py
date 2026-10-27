@@ -43,7 +43,11 @@ def linear_models(tmp_path_factory):
 
 
 class Setup:
-    """A complete synthetic search result plus an isolated holdout window (rows 320-400)."""
+    """A complete synthetic search result plus an isolated holdout window (rows 320-400).
+
+    Every artifact lives under ``self.root`` (the fixture's repository root) so the
+    candidate can carry root-relative paths.
+    """
 
     def __init__(self, root: Path, models: dict[str, Path]):
         fixture = experiment_fixtures.OrchestratorTests()
@@ -55,6 +59,7 @@ class Setup:
             "end": (times[0] + pd.Timedelta(minutes=300)).isoformat(),
         }
         fixture.save()
+        root = fixture.root
         self.fixture, self.root, self.times = fixture, root, times
         self.trial_config = fixture.path
         seeds = fixture.config["training"]["seeds"]
@@ -64,12 +69,14 @@ class Setup:
         for seed in seeds:
             path = model_dir / f"seed-{seed}.zip"
             shutil.copyfile(models["linear"], path)
+            # Evidence keeps the absolute VPS path; holdout_eval must never dereference it.
             rows.append({"seed": seed, "status": "COMPLETE", "metrics": {"profit_factor": 1.5}, "training": {
                 "seed": seed, "model_path": str(path), "model_sha256": sha(path),
                 "policy_architecture": "linear_actor",
             }})
         features = fixture.config["features"]
-        alpha = load_alpha_model(fixture.root / features["alpha_manifest_path"], features["alpha_manifest_sha256"])
+        self.manifest = root / features["alpha_manifest_path"]
+        alpha = load_alpha_model(self.manifest, features["alpha_manifest_sha256"])
         self.evidence = root / "candidate_evidence.json"
         self.write_evidence({
             "run_status": "COMPLETE", "validation_state": "READY_FOR_OFFLINE_EXECUTION",
@@ -82,30 +89,45 @@ class Setup:
         self.schedule.write_text(json.dumps([stamp.isoformat() for stamp in times]))
         self.flag = root / "data" / "holdout_used.flag"
         self.report = root / "reports" / "true_holdout_eval.json"
-        self.candidate = root / "best_candidate_config.json"
+        self.candidate = root / "config" / "best_candidate_config.json"
+        self.candidate.parent.mkdir()
         self.write_candidate()
 
     def write_evidence(self, evidence):
         self.evidence.write_text(json.dumps(evidence))
 
+    def artifacts(self) -> dict:
+        def rel(path):
+            return Path(path).relative_to(self.root).as_posix()
+        evidence = json.loads(self.evidence.read_text())
+        return {
+            "trial_config": {"path": rel(self.trial_config), "sha256": sha(self.trial_config)},
+            "evidence": {"path": rel(self.evidence), "sha256": sha(self.evidence)},
+            "alpha_manifest": {"path": rel(self.manifest), "sha256": sha(self.manifest)},
+            "models": [{"seed": row["seed"], "path": rel(row["training"]["model_path"]),
+                        "sha256": row["training"]["model_sha256"]} for row in evidence["results"]],
+        }
+
     def write_candidate(self, **overrides):
         candidate = {
             "contract": "holdout_candidate_v1", "trial_number": 0,
             "objective": {"metric": "median_profit_factor", "value": 1.5}, "params": {"learning_rate": 3e-4},
-            "trial_config_path": str(self.trial_config), "trial_config_sha256": sha(self.trial_config),
-            "evidence_path": str(self.evidence), "evidence_sha256": sha(self.evidence),
+            "path_anchor": "repository_root", "artifacts": self.artifacts(),
             "theta_accept": {"metric": "median_profit_factor", "value": 1.25},
             "requires_fresh_holdout": True, **overrides,
         }
         self.candidate.write_text(json.dumps(candidate))
 
-    def run(self, data=None, digest=None, start=320, end=400):
+    def run(self, data=None, digest=None, start=320, end=400, root=None):
         data = data or self.data
+        root = root or self.root
         return run_holdout(
             data, digest or sha(data),
             (self.times[0] + pd.Timedelta(minutes=start)).isoformat(),
             (self.times[0] + pd.Timedelta(minutes=end)).isoformat(),
-            self.schedule, candidate_path=self.candidate, flag_path=self.flag, report_path=self.report,
+            root / "rth.json", candidate_path=root / "config" / "best_candidate_config.json",
+            flag_path=root / "data" / "holdout_used.flag",
+            report_path=root / "reports" / "true_holdout_eval.json", root=root,
         )
 
 
@@ -139,11 +161,28 @@ def test_existing_flag_or_prior_audit_refuses(setup):
 
 
 @pytest.mark.parametrize("tamper", ["candidate_contract", "trial_config", "evidence", "model", "mlp_actor",
-                                    "weak_theta", "overlap", "missing_seed", "alpha"])
+                                    "weak_theta", "overlap", "missing_seed", "alpha", "absolute_path",
+                                    "escaping_path", "windows_path", "model_not_in_evidence"])
 def test_integrity_failures_refuse_before_burning(setup, linear_models, tamper):
     start = 320
     if tamper == "candidate_contract":
         setup.write_candidate(contract="params_only")
+    elif tamper in ("absolute_path", "escaping_path", "windows_path", "model_not_in_evidence"):
+        artifacts = setup.artifacts()
+        model = artifacts["models"][0]
+        if tamper == "absolute_path":
+            model["path"] = str(setup.root / model["path"])
+        elif tamper == "escaping_path":
+            model["path"] = "models/../models/" + model["path"].split("/")[-1]
+        elif tamper == "windows_path":
+            model["path"] = model["path"].replace("/", "\\")
+        else:
+            # A hash-valid file the search never evaluated.
+            other = setup.root / "models" / "other.zip"
+            shutil.copyfile(linear_models["linear"], other)
+            other.write_bytes(other.read_bytes() + b"\0")
+            model.update(path="models/other.zip", sha256=sha(other))
+        setup.write_candidate(artifacts=artifacts)
     elif tamper == "trial_config":
         setup.trial_config.write_bytes(setup.trial_config.read_bytes() + b" ")
     elif tamper == "evidence":
@@ -221,6 +260,36 @@ def test_acceptance_requires_theta_and_every_check(setup):
     with patch("orchestrator._evaluate_seed", side_effect=scored(1.2)):
         report = setup.run()
     assert report["median_oos"] == 1.2 and report["accepted"] is False
+
+
+def test_report_paths_are_root_relative_and_bind_the_flag(setup):
+    def fake(frozen, active, settings, annualization):
+        return {"status": "COMPLETE", "metrics": {"profit_factor": 1.3}, "undefined_reasons": [],
+                "initial_cash": 10000, "final_cash": 10100, "terminal_liquidation_pnl": 0}
+
+    with patch("orchestrator._evaluate_seed", side_effect=fake):
+        report = setup.run()
+    assert report["holdout"]["burn_flag"] == "data/holdout_used.flag"
+    assert report["candidate"]["path"] == "config/best_candidate_config.json"
+    assert [row["model_path"] for row in report["seeds"]] == [
+        f"models/seed-{seed}.zip" for seed in setup.fixture.config["training"]["seeds"]]
+
+
+def test_candidate_relocates_to_another_clone(setup, tmp_path):
+    """A candidate exported on one machine resolves in a copy at another absolute path."""
+    clone = tmp_path / "windows_clone"
+    shutil.copytree(setup.root, clone)
+    shutil.rmtree(setup.root / "models")  # the original absolute model paths are now dead
+
+    def fake(frozen, active, settings, annualization):
+        assert Path(frozen["model_path"]).is_relative_to(clone)
+        return {"status": "COMPLETE", "metrics": {"profit_factor": 1.3}, "undefined_reasons": [],
+                "initial_cash": 10000, "final_cash": 10100, "terminal_liquidation_pnl": 0}
+
+    with patch("orchestrator._evaluate_seed", side_effect=fake):
+        report = setup.run(data=clone / "bars.csv", root=clone)
+    assert report["accepted"] is True
+    assert (clone / "data" / "holdout_used.flag").is_file() and not setup.flag.exists()
 
 
 def test_reconciliation_failure_is_recorded_after_burn(setup):

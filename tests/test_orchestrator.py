@@ -355,12 +355,23 @@ class OrchestratorTests(unittest.TestCase):
             "parameters": {}, "parameter_binding": POLICY_PARAMETER_BINDING, "policy_seed": 42,
         }
         self.save()
-        orchestrator = OfflineOrchestrator(self.reports)
+        orchestrator = OfflineOrchestrator(self.reports, repository_root=self.root)
         report = orchestrator.run_pipeline(self.path)
         self.assertEqual(report["run_status"], "COMPLETE", report["errors"])
         # Real research gates fail on synthetic data; force PASS only to reach the build step.
         report["pass"] = True
         orchestrator.context["deployment"] = {"requested": True}
+        # Without the single-shot holdout audit the patcher must never run.
+        with patch("engine_mt5.patcher.MQL5Patcher") as patcher, \
+             patch("governance.telegram_notifier.TelegramAlertEngine"):
+            refused = orchestrator.execute_deployment_gate(report)
+        self.assertEqual(refused["status"], "INVALID")
+        self.assertIn("accepted single-shot holdout", refused["reason"])
+        patcher.assert_not_called()
+        from holdout_fixtures import write_accepted_holdout
+        write_accepted_holdout(self.root, {row["seed"]: row["training"]["model_path"]
+                                           for row in report["results"]}, orchestrator.context["alpha"])
+        orchestrator.context["run_id"] += "-accepted"
 
         def compile_fixture(_compiler, staged):
             staged = Path(staged)

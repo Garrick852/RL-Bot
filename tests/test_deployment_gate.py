@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from alpha_fixtures import install_alpha
+from holdout_fixtures import write_accepted_holdout
 from engine_mt5.patcher import CompilationError, SourcePatchError
 from engine_rl import linear_policy as contract
 from governance.validator import ValidationState
@@ -49,7 +50,15 @@ def gate(tmp_path, policies):
     source.with_suffix(".ex5").write_bytes(b"original binary")
     manifest_name, manifest_sha = install_alpha(tmp_path)
     manifest = load_manifest(tmp_path / manifest_name)
-    orchestrator = OfflineOrchestrator(tmp_path / "reports")
+    alpha = {"manifest_sha256": manifest_sha, "onnx_sha256": manifest["onnx_sha256"]}
+    # The single-shot holdout accepted these frozen models; --deploy injects only them.
+    (tmp_path / "models").mkdir()
+    accepted = {}
+    for seed in SEEDS:
+        accepted[seed] = tmp_path / "models" / f"seed-{seed}.zip"
+        accepted[seed].write_bytes(models["linear"].read_bytes())
+    write_accepted_holdout(tmp_path, accepted, alpha)
+    orchestrator = OfflineOrchestrator(tmp_path / "run_reports", repository_root=tmp_path)
     orchestrator._config_base = tmp_path
     orchestrator.config = {
         "dataset": {"symbol": "TEST"},
@@ -64,7 +73,7 @@ def gate(tmp_path, policies):
     }
     orchestrator.context = {
         "run_id": "candidate-1", "deployment": {"requested": True},
-        "alpha": {"manifest_sha256": manifest_sha, "onnx_sha256": manifest["onnx_sha256"]},
+        "alpha": dict(alpha),
     }
     model_sha = hashlib.sha256(models["linear"].read_bytes()).hexdigest()
     report = {
@@ -130,7 +139,11 @@ def test_success_injects_verified_policy_and_alpha_into_staged_source_only(gate,
     assert source.with_suffix(".ex5").read_bytes() == b"original binary"
     assert result["policy_exported"] is True
     assert result["policy_seed"] == 42
-    assert result["policy_model_sha256"] == report["results"][1]["training"]["model_sha256"]
+    assert result["policy_model_sha256"] == hashlib.sha256(
+        (source.parent / "models" / "seed-42.zip").read_bytes()).hexdigest()
+    assert result["policy_source"] == "holdout_accepted_frozen_model"
+    holdout = source.parent / "reports" / "true_holdout_eval.json"
+    assert result["holdout_report_sha256"] == hashlib.sha256(holdout.read_bytes()).hexdigest()
     assert result["alpha_onnx_sha256"] == manifest["onnx_sha256"]
     assert result["required_onnx_file"] == "xgb_alpha.onnx"
     assert result["live_deployment_performed"] is False
@@ -153,10 +166,11 @@ def test_fallback_counts_are_persisted_and_suspension_cannot_auto_reset(gate):
             if index == 2:
                 assert result["directive"]["risk_size_scale"] == .5
         # A fresh coordinator with passing metrics must honor the on-disk latch.
-        resumed = OfflineOrchestrator(orchestrator.report_directory)
+        resumed = OfflineOrchestrator(orchestrator.report_directory, repository_root=orchestrator.repository_root)
         resumed.config = orchestrator.config
         resumed._config_base = orchestrator._config_base
-        resumed.context = {"run_id": "passing-candidate", "deployment": {"requested": True}}
+        resumed.context = {"run_id": "passing-candidate", "deployment": {"requested": True},
+                           "alpha": orchestrator.context["alpha"]}
         report["pass"] = True
         assert resumed.execute_deployment_gate(report)["status"] == "SUSPENDED"
         assert journal(resumed)["consecutive_failures"] == 3
@@ -204,19 +218,63 @@ def test_config_supplied_policy_matrix_or_alpha_override_is_refused(gate):
     assert not list(source.parent.glob("*.staged.mq5"))
 
 
-@pytest.mark.parametrize("tamper", ["mlp", "model_sha", "seed", "binding", "alpha", "undeclared_seed"])
+def holdout_path(source):
+    return source.parent / "reports" / "true_holdout_eval.json"
+
+
+def edit_holdout(source, change):
+    path = holdout_path(source)
+    audit = json.loads(path.read_text())
+    change(audit)
+    path.write_text(json.dumps(audit))
+
+
+@pytest.mark.parametrize("tamper", [
+    "missing_report", "not_accepted", "gap_failed", "below_theta", "wrong_contract", "flag_missing",
+    "flag_mismatch", "model_hash_drift", "model_swapped", "mlp", "absolute_model_path", "seed_missing",
+    "seed_not_complete", "holdout_alpha_drift", "binding", "alpha", "undeclared_seed",
+])
 def test_unverifiable_policy_or_alpha_never_reaches_patcher(gate, policies, tamper):
-    orchestrator, report, source, _ = gate
+    orchestrator, report, source, notifier = gate
     models, _ = policies
-    selected = report["results"][1]["training"]
-    if tamper == "mlp":
-        selected.update(model_path=str(models["mlp"]),
-                        model_sha256=hashlib.sha256(models["mlp"].read_bytes()).hexdigest(),
-                        policy_architecture="mlp_tanh_128x128")
-    elif tamper == "model_sha":
-        selected["model_sha256"] = "0" * 64
-    elif tamper == "seed":
-        report["results"] = [row for row in report["results"] if row["seed"] != 42]
+    root = source.parent
+    seed_model = root / "models" / "seed-42.zip"
+
+    def seed_row(audit):
+        return next(row for row in audit["seeds"] if row["seed"] == 42)
+
+    if tamper == "missing_report":
+        holdout_path(source).unlink()
+    elif tamper == "not_accepted":
+        edit_holdout(source, lambda audit: audit.update(accepted=False))
+    elif tamper == "gap_failed":
+        edit_holdout(source, lambda audit: audit.update(gap_ok=False))
+    elif tamper == "below_theta":
+        edit_holdout(source, lambda audit: audit.update(median_oos=1.0))
+    elif tamper == "wrong_contract":
+        edit_holdout(source, lambda audit: audit.update(contract="hand_written"))
+    elif tamper == "flag_missing":
+        (root / "data" / "holdout_used.flag").unlink()
+    elif tamper == "flag_mismatch":
+        (root / "data" / "holdout_used.flag").write_text(json.dumps(
+            {"dataset_sha256": "e" * 64, "candidate_sha256": "c" * 64}))
+    elif tamper == "model_hash_drift":
+        seed_model.write_bytes(seed_model.read_bytes() + b"\0")
+    elif tamper == "model_swapped":
+        edit_holdout(source, lambda audit: seed_row(audit).update(model_sha256="0" * 64))
+    elif tamper == "mlp":
+        seed_model.write_bytes(models["mlp"].read_bytes())
+        edit_holdout(source, lambda audit: seed_row(audit).update(
+            model_sha256=hashlib.sha256(seed_model.read_bytes()).hexdigest()))
+    elif tamper == "absolute_model_path":
+        edit_holdout(source, lambda audit: seed_row(audit).update(model_path=str(seed_model)))
+    elif tamper == "seed_missing":
+        edit_holdout(source, lambda audit: audit.update(
+            seeds=[row for row in audit["seeds"] if row["seed"] != 42]))
+    elif tamper == "seed_not_complete":
+        edit_holdout(source, lambda audit: seed_row(audit).update(status="RECONCILIATION_FAILED"))
+    elif tamper == "holdout_alpha_drift":
+        edit_holdout(source, lambda audit: audit["candidate"].update(alpha_onnx_sha256="0" * 64))
     elif tamper == "binding":
         orchestrator.config["deployment"]["parameter_binding"] = "fixed_strategy_parameters_not_ppo_policy"
     elif tamper == "alpha":
@@ -228,6 +286,21 @@ def test_unverifiable_policy_or_alpha_never_reaches_patcher(gate, policies, tamp
     assert result["status"] == "INVALID"
     patcher.assert_not_called()
     assert not list(source.parent.glob("*.staged.mq5"))
+    assert source.read_bytes() == TEMPLATE.read_bytes()
+    notifier.send_deployment_success.assert_not_called()
+
+
+def test_freshly_retrained_run_models_are_never_injected(gate, policies):
+    """The deploy run's own models are ignored; only the holdout-accepted model is patched in."""
+    orchestrator, report, _, _ = gate
+    models, expected = policies
+    for row in report["results"]:
+        row["training"].update(model_path=str(models["mlp"]), model_sha256="f" * 64)
+    with patch("engine_mt5.patcher.MQL5Patcher.compile_ea", side_effect=compile_fixture):
+        result = orchestrator.execute_deployment_gate(report)
+    assert result["status"] == "STAGED_BUILD_SUCCEEDED", result.get("reason")
+    staged = Path(result["staged_source"]).read_text()
+    np.testing.assert_array_equal(parse_matrix(staged, "PPO_WEIGHTS"), np.asarray(expected["PPO_WEIGHTS"]))
 
 
 @pytest.mark.parametrize("passing", [True, False])

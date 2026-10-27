@@ -19,12 +19,14 @@ from optimizer import OfflineOptimizer, SAMPLER_SEED, STORAGE_URL, main
 
 @pytest.fixture
 def experiment(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
     fixture = experiment_fixtures.OrchestratorTests()
     fixture.setUp()
+    # The fixture root plays the repository root that candidate paths are anchored to.
+    monkeypatch.chdir(fixture.root)
     try:
         yield fixture
     finally:
+        monkeypatch.chdir(tmp_path)
         fixture.doCleanups()
 
 
@@ -34,7 +36,10 @@ def evidence(config, values=(1.1, 1.5, 20.0)):
         "rl_training_performed": True, "scope": "HYPERPARAMETER_SEARCH_ONLY",
         "median_oos_metrics": {"profit_factor": sorted(values)[1]},
         "results": [
-            {"seed": seed, "status": "COMPLETE", "metrics": {"profit_factor": value}}
+            {"seed": seed, "status": "COMPLETE", "metrics": {"profit_factor": value}, "training": {
+                "seed": seed, "model_path": str(Path.cwd() / "reports" / "models" / f"seed-{seed}.zip"),
+                "model_sha256": f"{seed:064d}", "policy_architecture": "linear_actor",
+            }}
             for seed, value in zip(config["training"]["seeds"], values)
         ],
     }
@@ -88,10 +93,19 @@ def test_trials_copy_config_inject_parameters_and_export_exact_best_dictionary(e
         "metric": "median_profit_factor",
         "value": experiment.config["evaluation"]["research_gate_thresholds"]["min_profit_factor"],
     }
-    for kind in ("trial_config", "evidence"):
-        artifact = Path(candidate[f"{kind}_path"])
-        assert hashlib.sha256(artifact.read_bytes()).hexdigest() == candidate[f"{kind}_sha256"]
-    assert json.loads(Path(candidate["evidence_path"]).read_text())["median_oos_metrics"]["profit_factor"] == 1.5
+    assert candidate["path_anchor"] == "repository_root"
+    artifacts = candidate["artifacts"]
+    for kind in ("trial_config", "evidence", "alpha_manifest"):
+        relative = artifacts[kind]["path"]
+        assert not Path(relative).is_absolute() and "\\" not in relative and ".." not in relative
+        assert hashlib.sha256(Path(relative).read_bytes()).hexdigest() == artifacts[kind]["sha256"]
+    assert artifacts["alpha_manifest"]["path"] == experiment.config["features"]["alpha_manifest_path"]
+    assert artifacts["models"] == [
+        {"seed": seed, "path": f"reports/models/seed-{seed}.zip", "sha256": f"{seed:064d}"}
+        for seed in experiment.config["training"]["seeds"]
+    ]
+    saved = json.loads(Path(artifacts["evidence"]["path"]).read_text())
+    assert saved["median_oos_metrics"]["profit_factor"] == 1.5
     assert Path("reports/optuna_vps_study.db").is_file()
     assert isinstance(study.sampler, optuna.samplers.TPESampler)
     assert study.trials[0].user_attrs["eligible_objective"] is True
@@ -152,6 +166,19 @@ def test_broken_multiseed_evidence_is_pruned_never_exported(experiment, failure)
     assert not Path("config/best_candidate_config.json").exists()
 
 
+def test_artifact_outside_repository_root_is_pruned_not_exported(experiment, tmp_path):
+    def outside(path, *, deploy):
+        report = evidence(json.loads(Path(path).read_text()))
+        report["results"][0]["training"]["model_path"] = str(tmp_path / "elsewhere" / "seed-7.zip")
+        return report
+
+    with patch("optimizer.OfflineOrchestrator.run_pipeline", side_effect=outside):
+        study = OfflineOptimizer(experiment.path).optimize(1)
+    assert study.trials[0].state == TrialState.PRUNED
+    assert "outside the repository root" in study.trials[0].user_attrs["failure_reason"]
+    assert not Path("config/best_candidate_config.json").exists()
+
+
 def test_export_only_changes_on_strict_high_water_mark(experiment):
     optimizer = OfflineOptimizer(experiment.path)
     study = optuna.create_study(direction="maximize")
@@ -160,8 +187,11 @@ def test_export_only_changes_on_strict_high_water_mark(experiment):
             params={"learning_rate": param},
             distributions={"learning_rate": optuna.distributions.FloatDistribution(1e-5, 1e-3, log=True)},
             value=value, user_attrs={
-                "eligible_objective": True, "trial_config_path": f"t{param}.json", "trial_config_sha256": "a" * 64,
-                "evidence_path": f"e{param}.json", "evidence_sha256": "b" * 64,
+                "eligible_objective": True, "candidate_artifacts": {
+                    "trial_config": {"path": f"t{param}.json", "sha256": "a" * 64},
+                    "evidence": {"path": f"e{param}.json", "sha256": "b" * 64},
+                    "alpha_manifest": {"path": "alpha.json", "sha256": "c" * 64}, "models": [],
+                },
             },
         )
         study.add_trial(trial)
@@ -170,7 +200,7 @@ def test_export_only_changes_on_strict_high_water_mark(experiment):
             assert write.call_count == (1 if value == 2.0 or param == 1e-4 else 0)
     candidate = json.loads(optimizer.candidate_path.read_text())
     assert candidate["params"] == {"learning_rate": 4e-4}
-    assert candidate["evidence_path"] == "e0.0004.json"
+    assert candidate["artifacts"]["evidence"]["path"] == "e0.0004.json"
 
 
 def test_best_trial_without_hash_bound_evidence_is_not_exported(experiment):

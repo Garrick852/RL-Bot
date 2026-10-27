@@ -38,7 +38,8 @@ import pandas as pd  # noqa: E402
 
 from engine_rl.alpha_pipeline import AlphaModel, load_alpha_model  # noqa: E402
 from orchestrator import (  # noqa: E402
-    OfflineOrchestrator, _atomic_json, _json_ready, _local_path, _reject_constant, _unique_object,
+    HOLDOUT_REPORT_CONTRACT, OfflineOrchestrator, PipelineError, _atomic_json, _json_ready, _reject_constant,
+    _resolve_in_root, _root_relative, _unique_object,
 )
 
 LOGGER = logging.getLogger("holdout_eval")
@@ -46,7 +47,7 @@ FLAG_PATH = Path("data/holdout_used.flag")
 REPORT_PATH = Path("reports/true_holdout_eval.json")
 DEFAULT_CANDIDATE = Path("config/best_candidate_config.json")
 CANDIDATE_CONTRACT = "holdout_candidate_v1"
-REPORT_CONTRACT = "true_holdout_eval_v1"
+REPORT_CONTRACT = HOLDOUT_REPORT_CONTRACT
 ACCEPT_METRIC = "median_profit_factor"
 
 
@@ -137,30 +138,48 @@ def burn(flag_path: Path, payload: dict[str, Any]) -> None:
         os.fsync(stream.fileno())
 
 
-def load_candidate(candidate_path: str | Path, holdout_start: pd.Timestamp) -> Candidate:
+def _artifact(entry: Any, root: Path, name: str) -> tuple[Path, str]:
+    """Resolve a root-relative ``{"path", "sha256"}`` artifact and verify its bytes."""
+    _require(isinstance(entry, dict) and set(entry) == {"path", "sha256"} and _is_sha256(entry["sha256"]),
+             f"{name} must be a {{path, sha256}} artifact")
+    try:
+        path = _resolve_in_root(entry["path"], root, name)
+    except PipelineError as exc:
+        raise HoldoutPreflightError(str(exc)) from exc
+    _require(path.is_file() and _sha256(path) == entry["sha256"], f"{name} SHA-256 mismatch at {entry['path']}")
+    return path, entry["sha256"]
+
+
+def load_candidate(candidate_path: str | Path, holdout_start: pd.Timestamp, root: Path | None = None) -> Candidate:
     """Verify every candidate artifact by hash; read no holdout contents.
+
+    Artifact paths are root-relative POSIX paths, so a candidate exported on a
+    Linux VPS resolves in a Windows clone. Absolute paths embedded inside the
+    hashed trial config and evidence are deliberately never dereferenced.
 
     Raises:
         HoldoutPreflightError: Any binding, hash, architecture, or chronology check fails.
     """
+    root = Path.cwd() if root is None else Path(root)
     path = Path(candidate_path)
     try:
         candidate = _load_json(path)
     except (OSError, ValueError) as exc:
         raise HoldoutPreflightError(f"cannot read candidate {path}: {exc}") from exc
-    keys = {"contract", "trial_number", "objective", "params", "trial_config_path", "trial_config_sha256",
-            "evidence_path", "evidence_sha256", "theta_accept", "requires_fresh_holdout"}
+    keys = {"contract", "trial_number", "objective", "params", "path_anchor", "artifacts", "theta_accept",
+            "requires_fresh_holdout"}
     _require(isinstance(candidate, dict) and set(candidate) == keys
-             and candidate["contract"] == CANDIDATE_CONTRACT,
+             and candidate["contract"] == CANDIDATE_CONTRACT and candidate["path_anchor"] == "repository_root",
              f"candidate must be an optimizer-exported {CANDIDATE_CONTRACT} with exactly {sorted(keys)}")
     theta = candidate["theta_accept"]
     _require(isinstance(theta, dict) and set(theta) == {"metric", "value"} and theta["metric"] == ACCEPT_METRIC
              and type(theta["value"]) in (int, float) and math.isfinite(theta["value"]) and theta["value"] > 0,
              f"theta_accept must be a positive finite {ACCEPT_METRIC} threshold")
+    artifacts = candidate["artifacts"]
+    _require(isinstance(artifacts, dict) and set(artifacts) == {"trial_config", "evidence", "alpha_manifest", "models"},
+             "candidate artifacts must list trial_config, evidence, alpha_manifest and models")
 
-    config_path = Path(candidate["trial_config_path"])
-    _require(_is_sha256(candidate["trial_config_sha256"]) and config_path.is_file()
-             and _sha256(config_path) == candidate["trial_config_sha256"], "trial config SHA-256 mismatch")
+    config_path, config_sha = _artifact(artifacts["trial_config"], root, "trial config")
     config = _load_json(config_path)
     profile = OfflineOrchestrator()
     profile.config = config
@@ -172,34 +191,38 @@ def load_candidate(candidate_path: str | Path, holdout_start: pd.Timestamp) -> C
     _require(theta["value"] >= minimum,
              f"theta_accept {theta['value']} weakens predeclared min_profit_factor {minimum}")
 
-    evidence_path = Path(candidate["evidence_path"])
-    _require(_is_sha256(candidate["evidence_sha256"]) and evidence_path.is_file()
-             and _sha256(evidence_path) == candidate["evidence_sha256"], "candidate evidence SHA-256 mismatch")
+    evidence_path, evidence_sha = _artifact(artifacts["evidence"], root, "candidate evidence")
     evidence = _load_json(evidence_path)
     _require(isinstance(evidence, dict) and evidence.get("run_status") == "COMPLETE"
              and evidence.get("validation_state") == "READY_FOR_OFFLINE_EXECUTION"
              and evidence.get("models_frozen_before_oos") is True
-             and evidence.get("config_hash") == candidate["trial_config_sha256"],
+             and evidence.get("config_hash") == config_sha,
              "evidence is not a complete frozen run of this trial config")
     seeds = config["training"]["seeds"]
     rows = evidence.get("results")
     _require(isinstance(rows, list) and sorted(row.get("seed") for row in rows) == sorted(seeds)
              and len(rows) == len(seeds), "evidence must hold exactly one result per predeclared seed")
+    listed = artifacts["models"]
+    _require(isinstance(listed, list) and [m.get("seed") if isinstance(m, dict) else None for m in listed] == seeds,
+             "candidate models must list every predeclared seed in order")
     by_seed = {row["seed"]: row for row in rows}
     frozen = []
-    for seed in seeds:
+    for entry in listed:
+        seed = entry["seed"]
         training = by_seed[seed].get("training") or {}
         _require(training.get("seed") == seed and training.get("policy_architecture") == "linear_actor",
                  f"seed {seed} is not a linear_actor policy")
-        model = Path(training.get("model_path", ""))
-        _require(model.is_file() and _sha256(model) == training.get("model_sha256"),
-                 f"seed {seed} frozen model SHA-256 mismatch")
-        frozen.append({"seed": seed, "model_path": str(model), "model_sha256": training["model_sha256"]})
+        model, model_sha = _artifact({"path": entry.get("path"), "sha256": entry.get("sha256")}, root,
+                                     f"seed {seed} frozen model")
+        _require(model_sha == training.get("model_sha256"), f"seed {seed} model differs from the search evidence")
+        frozen.append({"seed": seed, "model_path": str(model), "model_sha256": model_sha,
+                       "relative_path": entry["path"]})
 
     features = config["features"]
+    manifest_path, manifest_sha = _artifact(artifacts["alpha_manifest"], root, "alpha manifest")
+    _require(manifest_sha == features["alpha_manifest_sha256"], "alpha manifest differs from the trial config")
     try:
-        alpha = load_alpha_model(_local_path(features["alpha_manifest_path"], config_path.parent),
-                                 features["alpha_manifest_sha256"])
+        alpha = load_alpha_model(manifest_path, manifest_sha)
     except Exception as exc:
         raise HoldoutPreflightError(f"alpha artifacts refused: {exc}") from exc
     recorded = evidence.get("alpha") or {}
@@ -210,8 +233,8 @@ def load_candidate(candidate_path: str | Path, holdout_start: pd.Timestamp) -> C
                      if isinstance(bounds, dict) and "end" in bounds)
     _require(holdout_start >= search_end,
              f"holdout start {holdout_start.isoformat()} overlaps search data ending {search_end.isoformat()}")
-    return Candidate(path, _sha256(path), candidate["trial_number"], config, candidate["trial_config_sha256"],
-                     candidate["evidence_sha256"], float(theta["value"]), tuple(frozen), alpha)
+    return Candidate(path, _sha256(path), candidate["trial_number"], config, config_sha,
+                     evidence_sha, float(theta["value"]), tuple(frozen), alpha)
 
 
 def _verify_linear(candidate: Candidate) -> None:
@@ -304,7 +327,8 @@ def _evaluate(
                 outcome["seeds"].append({"seed": frozen["seed"], "status": "RECONCILIATION_FAILED"})
                 continue
             outcome["seeds"].append({
-                "seed": frozen["seed"], "status": result["status"], "model_sha256": frozen["model_sha256"],
+                "seed": frozen["seed"], "status": result["status"], "model_path": frozen["relative_path"],
+                "model_sha256": frozen["model_sha256"],
                 "metrics": result["metrics"], "undefined_reasons": result["undefined_reasons"],
                 "initial_cash": result["initial_cash"], "final_cash": result["final_cash"],
                 "terminal_liquidation_pnl": result["terminal_liquidation_pnl"],
@@ -331,13 +355,19 @@ def run_holdout(
     candidate_path: str | Path = DEFAULT_CANDIDATE,
     flag_path: str | Path = FLAG_PATH,
     report_path: str | Path = REPORT_PATH,
+    root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run the single-shot holdout evaluation and persist its audit.
+
+    Every path recorded in the audit (burn flag, candidate, frozen models) is
+    relative to ``root`` (default: cwd = repository root) so ``--deploy`` can
+    verify it from any clone on any OS.
 
     Raises:
         ValueError: Holdout SHA-256 mismatch or candidate preflight refusal (no burn).
         HoldoutAlreadyUsedError: The holdout was already burned.
     """
+    anchor = Path.cwd() if root is None else Path(root)
     data = Path(data_path)
     flag, report_file = Path(flag_path), Path(report_path)
     digest = verify_dataset_sha256(data, sha256)
@@ -346,7 +376,12 @@ def run_holdout(
     _require(start < end, "holdout_start must precede holdout_end")
     schedule = _load_schedule(rth_schedule_path)
     schedule_sha = _sha256(Path(rth_schedule_path))
-    candidate = load_candidate(candidate_path, start)
+    candidate = load_candidate(candidate_path, start, anchor)
+    try:
+        flag_relative = _root_relative(flag, anchor)
+        candidate_relative = _root_relative(candidate.path, anchor)
+    except PipelineError as exc:
+        raise HoldoutPreflightError(str(exc)) from exc
     _verify_linear(candidate)
 
     burned_at = datetime.now(timezone.utc).isoformat()
@@ -379,10 +414,10 @@ def run_holdout(
             "start": start.isoformat(), "end_exclusive": end.isoformat(),
             "rth_schedule_sha256": schedule_sha,
             "max_consecutive_missing": outcome["max_consecutive_missing"],
-            "partition": outcome["partition"], "burn_flag": str(flag), "burned_at": burned_at,
+            "partition": outcome["partition"], "burn_flag": flag_relative, "burned_at": burned_at,
         },
         "candidate": {
-            "path": str(candidate.path), "sha256": candidate.sha256, "trial_number": candidate.trial_number,
+            "path": candidate_relative, "sha256": candidate.sha256, "trial_number": candidate.trial_number,
             "trial_config_sha256": candidate.config_sha256, "evidence_sha256": candidate.evidence_sha256,
             "alpha_manifest_sha256": candidate.alpha.manifest_sha256,
             "alpha_onnx_sha256": candidate.alpha.onnx_sha256,

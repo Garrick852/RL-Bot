@@ -22,6 +22,8 @@ from governance.validator import ConfigValidator, ValidationState
 LOGGER = logging.getLogger(__name__)
 # Deploy binding: linear PPO head (3x12 + bias) plus the alpha manifest Z-score and windows.
 POLICY_PARAMETER_BINDING = "linear_ppo_policy_with_alpha_zscore_v1"
+HOLDOUT_REPORT_CONTRACT = "true_holdout_eval_v1"
+HOLDOUT_REPORT_PATH = Path("reports/true_holdout_eval.json")
 
 
 class PipelineError(ValueError):
@@ -68,6 +70,83 @@ def _local_path(value: str, base: Path) -> Path:
     _require(not value.startswith(("\\\\", "//")) and "://" not in value, "network paths are forbidden")
     path = Path(value)
     return path if path.is_absolute() else base / path
+
+
+def _root_relative(path: str | Path, root: Path) -> str:
+    """Portable POSIX path of ``path`` relative to the repository root; refuse escapes."""
+    resolved = Path(path).resolve()
+    try:
+        relative = resolved.relative_to(root.resolve())
+    except ValueError as exc:
+        raise PipelineError(f"{resolved} is outside the repository root {root}; it cannot be relocated") from exc
+    return relative.as_posix()
+
+
+def _resolve_in_root(value: Any, root: Path, name: str) -> Path:
+    """Resolve a recorded root-relative POSIX path on any OS; refuse absolute or escaping paths."""
+    _require(isinstance(value, str) and bool(value.strip()), f"{name} must be a nonempty relative path")
+    _require("\\" not in value and not value.startswith("/") and ":" not in value,
+             f"{name} must be a relative POSIX path, not {value!r}")
+    parts = value.split("/")
+    _require(all(part not in ("", ".", "..") for part in parts), f"{name} must not contain empty, '.' or '..' parts")
+    return root.joinpath(*parts)
+
+
+def verify_holdout_acceptance(
+    report_path: Path, root: Path, policy_seed: int, alpha: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove the single-shot holdout accepted exactly the policy about to be injected.
+
+    Args:
+        report_path: ``true_holdout_eval.json``.
+        root: Repository root that every recorded relative path is anchored to.
+        policy_seed: Predeclared seed whose frozen model will be injected.
+        alpha: ``{"manifest_sha256", "onnx_sha256"}`` of the alpha the EA receives.
+
+    Returns:
+        Hash-verified holdout model path/SHA and audit evidence.
+
+    Raises:
+        PipelineError: Missing/unaccepted report, missing or mismatched burn flag,
+            model or alpha hash drift.
+    """
+    _require(report_path.is_file(), f"--deploy requires an accepted single-shot holdout audit at {report_path}")
+    raw = report_path.read_bytes()
+    report = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+    _require(isinstance(report, dict) and report.get("contract") == HOLDOUT_REPORT_CONTRACT,
+             f"holdout audit must use contract {HOLDOUT_REPORT_CONTRACT}")
+    _require(report.get("evaluated_once") is True and report.get("gap_ok") is True
+             and report.get("reconciliation_ok") is True and report.get("accepted") is True,
+             "holdout audit is not accepted with evaluated_once, gap_ok and reconciliation_ok all true")
+    theta = report.get("theta_accept") or {}
+    median = report.get("median_oos")
+    _require(type(median) in (int, float) and math.isfinite(median)
+             and type(theta.get("value")) in (int, float) and median >= theta["value"],
+             "holdout median_oos does not meet the predeclared theta_accept")
+    holdout, candidate = report.get("holdout") or {}, report.get("candidate") or {}
+    flag = _resolve_in_root(holdout.get("burn_flag"), root, "holdout.burn_flag")
+    _require(flag.is_file(), "holdout burn flag is missing; the audit cannot be bound to a burned holdout")
+    burned = json.loads(flag.read_text("utf-8"), object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+    _require(isinstance(burned, dict) and burned.get("dataset_sha256") == holdout.get("dataset_sha256")
+             and burned.get("candidate_sha256") == candidate.get("sha256"),
+             "burn flag does not match the holdout audit's dataset and candidate hashes")
+    _require(candidate.get("alpha_manifest_sha256") == alpha.get("manifest_sha256")
+             and candidate.get("alpha_onnx_sha256") == alpha.get("onnx_sha256"),
+             "alpha artifacts differ from the holdout-accepted alpha")
+    rows = [row for row in report.get("seeds", []) if isinstance(row, dict) and row.get("seed") == policy_seed]
+    _require(len(rows) == 1 and rows[0].get("status") == "COMPLETE",
+             f"policy_seed {policy_seed} has no unique completed holdout evaluation")
+    model = _resolve_in_root(rows[0].get("model_path"), root, "holdout model_path")
+    _require(model.is_file() and hashlib.sha256(model.read_bytes()).hexdigest() == rows[0].get("model_sha256"),
+             "injected PPO model SHA-256 differs from the holdout-accepted model")
+    return {
+        "model_path": model, "model_sha256": rows[0]["model_sha256"],
+        "evidence": {
+            "holdout_report_sha256": hashlib.sha256(raw).hexdigest(), "holdout_median_oos": median,
+            "holdout_theta_accept": theta["value"], "holdout_dataset_sha256": holdout.get("dataset_sha256"),
+            "holdout_candidate_sha256": candidate.get("sha256"),
+        },
+    }
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -215,10 +294,23 @@ class OfflineOrchestrator:
     Args:
         report_directory: Destination for offline_audit_report.json and retained
             per-run snapshots. Defaults to the explicitly requested reports path.
+        repository_root: Anchor for relocatable holdout/candidate paths. Defaults to the cwd.
+        holdout_report: Accepted ``true_holdout_eval.json`` that ``--deploy`` requires.
+            Defaults to ``<repository_root>/reports/true_holdout_eval.json``.
     """
 
-    def __init__(self, report_directory: str | Path = "reports") -> None:
+    def __init__(
+        self,
+        report_directory: str | Path = "reports",
+        *,
+        repository_root: str | Path | None = None,
+        holdout_report: str | Path | None = None,
+    ) -> None:
         self.report_directory = Path(report_directory)
+        self.repository_root = Path(repository_root) if repository_root is not None else Path.cwd()
+        self.holdout_report = (
+            Path(holdout_report) if holdout_report is not None else self.repository_root / HOLDOUT_REPORT_PATH
+        )
         self.state = ValidationState.DRAFT_INCOMPLETE
         self.config: dict[str, Any] = {}
         self.context: dict[str, Any] = {}
@@ -669,9 +761,11 @@ class OfflineOrchestrator:
         """Opt-in staged build only; never load a terminal or install a policy.
 
         Research readiness, research PASS, and local build status are separate.
-        The staged EA receives the predeclared seed's linear PPO head
-        (``action_net`` weights/bias, re-loaded from its hash-verified model) and
-        the alpha manifest's Z-score and feature windows. Policy and alpha values
+        The staged EA receives the predeclared seed's linear PPO head from the
+        frozen model that ``reports/true_holdout_eval.json`` accepted (verified
+        by SHA-256 against the audit and the burn flag; a retrained model is never
+        injected) and the alpha manifest's Z-score and feature windows. Missing,
+        unaccepted, or hash-drifted holdout evidence blocks before the patcher. Policy and alpha values
         come only from verified artifacts; config ``parameters`` may add scalars
         but can never supply or override them. The original source and its
         binary remain unchanged.
@@ -710,6 +804,11 @@ class OfflineOrchestrator:
             policy_seed = deployment["policy_seed"]
             _require(type(policy_seed) is int and policy_seed in self.config["training"]["seeds"],
                      "deployment.policy_seed must be one of the predeclared training seeds")
+            # Cryptographic air-gap: nothing below runs unless the single-shot holdout
+            # accepted this exact policy model and alpha.
+            accepted = verify_holdout_acceptance(
+                self.holdout_report, self.repository_root, policy_seed, self.context.get("alpha", {}),
+            )
             source = _local_path(deployment["source_path"], self._config_base).absolute()
             compiler = _local_path(deployment["metaeditor_path"], self._config_base).absolute()
             # Persistent state is keyed to the asset/source, not the current run.
@@ -761,7 +860,7 @@ class OfflineOrchestrator:
             _require(isinstance(parameters, dict), "deployment.parameters must be an explicit scalar mapping")
             _require(all(not isinstance(value, (list, tuple, dict)) for value in parameters.values()),
                      "matrix parameters may only come from the hash-verified PPO model, never from config")
-            generated = self._policy_build_parameters(report, policy_seed)
+            generated = self._policy_build_parameters(accepted, policy_seed)
             collisions = sorted(set(parameters) & set(generated["parameters"]))
             _require(not collisions, f"config parameters may not override generated policy/alpha inputs: {collisions}")
             build_parameters = {**parameters, **generated["parameters"]}
@@ -806,23 +905,21 @@ class OfflineOrchestrator:
                     outcome.update(status="INVALID", lock_cleanup_error=str(exc))
                     LOGGER.error("Build lock could not be released: %s", exc)
 
-    def _policy_build_parameters(self, report: dict[str, Any], policy_seed: int) -> dict[str, Any]:
-        """Export the selected seed's linear policy and the run's alpha inputs for patching."""
+    def _policy_build_parameters(self, accepted: dict[str, Any], policy_seed: int) -> dict[str, Any]:
+        """Export the holdout-accepted seed's linear policy and the alpha inputs for patching."""
         from engine_rl.alpha_pipeline import EA_WINDOW_INPUTS, load_alpha_model
         from engine_rl.linear_policy import export_linear_policy
         from models.onnx_bridge import mql5_zscore_inputs
 
-        rows = [row for row in report["results"] if row.get("seed") == policy_seed]
-        _require(len(rows) == 1, f"policy_seed {policy_seed} has no unique OOS result in this run")
-        training = rows[0]["training"]
-        _require(training.get("policy_architecture") == "linear_actor",
-                 "only a linear_actor PPO head maps onto the EA's 3x12 matrix")
-        model_path = Path(training["model_path"])
-        model_sha = hashlib.sha256(model_path.read_bytes()).hexdigest()
-        _require(model_sha == training["model_sha256"], "frozen PPO model SHA-256 mismatch")
+        model_path = Path(accepted["model_path"])
+        raw = model_path.read_bytes()
+        model_sha = hashlib.sha256(raw).hexdigest()
+        _require(model_sha == accepted["model_sha256"], "holdout-accepted PPO model changed before injection")
         from stable_baselines3 import PPO
 
         policy = export_linear_policy(PPO.load(str(model_path), device="cpu"))
+        _require(hashlib.sha256(model_path.read_bytes()).hexdigest() == model_sha,
+                 "holdout-accepted PPO model changed during export")
         features = self.config["features"]
         alpha = load_alpha_model(
             _local_path(features["alpha_manifest_path"], self._config_base),
@@ -840,6 +937,8 @@ class OfflineOrchestrator:
                         "alpha_onnx_sha256": alpha.onnx_sha256[:16]},
             "evidence": {
                 "policy_seed": policy_seed, "policy_model_sha256": model_sha,
+                "policy_source": "holdout_accepted_frozen_model",
+                **accepted["evidence"],
                 "alpha_manifest_sha256": alpha.manifest_sha256,
                 "alpha_onnx_sha256": alpha.onnx_sha256,
                 # InpModelFile is not patched: the operator must install exactly this file.
@@ -864,10 +963,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--report-directory", type=Path, default=Path("reports"))
     parser.add_argument("--deploy", action="store_true",
                         help="Opt in to staged MQL5 patch/compile and Telegram; no terminal deployment")
+    parser.add_argument("--holdout-report", type=Path, default=None,
+                        help="Accepted true_holdout_eval.json (default: reports/true_holdout_eval.json)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     try:
-        report = OfflineOrchestrator(args.report_directory).run_pipeline(args.config_path, deploy=args.deploy)
+        report = OfflineOrchestrator(args.report_directory, holdout_report=args.holdout_report).run_pipeline(
+            args.config_path, deploy=args.deploy,
+        )
     except OSError:
         LOGGER.exception("Audit persistence failed")
         return 1
