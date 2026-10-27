@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <title>RL-Bot | 靜態規劃儀表板</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: #0f172a;
+      --surface: #1e293b;
+      --inset: #111c30;
+      --border: #3b4c63;
+      --text: #f1f5f9;
+      --muted: #b2bfd0;
+      --blue: #93c5fd;
+      --amber: #fcd480;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--background);
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      line-height: 1.65;
+    }
+    a { color: var(--blue); text-underline-offset: 0.22em; }
+    a:hover { color: var(--text); }
+    :focus-visible { outline: 3px solid var(--amber); outline-offset: 5px; }
+    .skip-link { position: absolute; left: 1rem; top: -6rem; padding: 0.5rem; background: var(--surface); }
+    .skip-link:focus { top: 0.5rem; }
+    .shell { max-width: 1240px; margin: auto; padding: 2rem; }
+    .eyebrow {
+      margin: 0 0 0.35rem;
+      color: var(--blue);
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+    }
+    header { display: flex; justify-content: space-between; align-items: start; gap: 1rem; }
+    h1 { font-size: clamp(1.65rem, 4vw, 2.25rem); letter-spacing: -0.035em; margin: 0; }
+    h2 { font-size: 1.15rem; margin: 0; }
+    h3 { font-size: 1rem; margin: 0 0 0.6rem; }
+    p { margin: 0.4rem 0; }
+    .subtitle, .muted { color: var(--muted); }
+    .badge {
+      display: inline-block;
+      padding: 0.3rem 0.7rem;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+    .notice {
+      margin: 1.5rem 0;
+      padding: 1rem 1.25rem;
+      border: 1px solid #74603d;
+      border-left: 3px solid var(--amber);
+      background: #252336;
+      border-radius: 0.5rem;
+    }
+    .notice strong { color: var(--amber); }
+    .notice p { color: #e1d9cd; font-size: 0.9rem; }
+    .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; margin: 0; }
+    .card, .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem; }
+    .card { padding: 1.15rem; min-width: 0; }
+    dt { color: var(--muted); font-size: 0.85rem; }
+    dd { margin: 0.45rem 0 0; font-size: 1.12rem; font-weight: 650; overflow-wrap: anywhere; }
+    dd small { display: block; margin-top: 0.4rem; font-size: 0.8rem; font-weight: 400; color: var(--muted); }
+    .draft { color: var(--amber); }
+    code, .code { font-family: ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+    .panel { padding: 1.4rem; margin-top: 1.25rem; }
+    .section-heading { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+    .section-heading p { font-size: 0.85rem; }
+    .pipeline { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0.75rem; padding: 0; margin: 1.25rem 0 0; list-style: none; }
+    .step { padding: 1rem; border: 1px solid var(--border); border-radius: 0.5rem; background: var(--inset); min-width: 0; }
+    .step-number { display: block; font-family: ui-monospace, Consolas, monospace; color: var(--muted); margin-bottom: 0.8rem; }
+    .step h3 { font-size: 0.9rem; margin: 0; }
+    .step p { font-size: 0.8rem; color: var(--muted); }
+    .step-status { display: block; border-top: 1px solid var(--border); padding-top: 0.6rem; margin-top: 0.8rem; font-size: 0.75rem; color: var(--muted); }
+    .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; }
+    ul { padding-left: 1.25rem; }
+    li { margin: 0.6rem 0; }
+    .planning-note { background: #0b1220; border: 1px solid var(--border); border-radius: 0.5rem; padding: 1rem; margin-top: 1rem; }
+    .planning-note p { font-size: 0.85rem; color: var(--muted); }
+    summary { cursor: pointer; color: var(--blue); font-weight: 600; }
+    details p { color: var(--muted); font-size: 0.9rem; margin-top: 0.75rem; }
+    footer { padding: 1.5rem 0 0; color: var(--muted); font-size: 0.8rem; }
+    nav { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 0.75rem; }
+    @media (max-width: 950px) {
+      .pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .pipeline li:last-child { grid-column: 1 / -1; }
+    }
+    @media (max-width: 640px) {
+      .shell { padding: 1.1rem; }
+      header, .section-heading { flex-direction: column; }
+      .metrics, .columns, .pipeline { grid-template-columns: 1fr; }
+      .pipeline li:last-child { grid-column: auto; }
+      .panel { padding: 1rem; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳至主要內容</a>
+  <div class="shell">
+    <header>
+      <div>
+        <p class="eyebrow">RL-BOT / MILESTONE 1</p>
+        <h1>離線驗證・規劃儀表板</h1>
+        <p class="subtitle">Offline Single-Strategy Validation</p>
+      </div>
+      <span class="badge">靜態原型 · 無執行系統連線</span>
+    </header>
+
+    <main id="main">
+      <aside class="notice" aria-label="規劃邊界">
+        <strong>僅供規劃檢視，不是即時監控</strong>
+        <p>所有內容為人工編寫的規劃快照，不會讀取設定檔、監測硬體或執行驗證器。
+          尚未提供歷史資料，實驗規格未凍結，亦無真實端到端實驗的驗收證據。</p>
+      </aside>
+
+      <section aria-labelledby="overview-heading">
+        <h2 id="overview-heading">規劃狀態</h2>
+        <p class="muted">以下為規劃標記，不是程式執行後產生的驗證結果。</p>
+        <dl class="metrics">
+          <div class="card">
+            <dt>整體狀態 / Overall status</dt>
+            <dd class="draft code">DRAFT_INCOMPLETE<small>必要資料及實驗設定尚未完成</small></dd>
+          </div>
+          <div class="card">
+            <dt>測試品種 / Symbol</dt>
+            <dd>尚未選定<small>未綁定任何歷史資料或品種</small></dd>
+          </div>
+          <div class="card">
+            <dt>工作程序 / Worker pool</dt>
+            <dd>未啟動<small>未取得 CPU 核心數或資源分配資訊</small></dd>
+          </div>
+          <div class="card">
+            <dt>驗證狀態 / Validation</dt>
+            <dd>尚未執行驗證<small>離線設定驗證器尚未實作</small></dd>
+          </div>
+          <div class="card">
+            <dt>資料證據 / Data evidence</dt>
+            <dd class="code">EVIDENCE_UNCHECKED<small>未檢查檔案、SHA-256 或資料合法性</small></dd>
+          </div>
+          <div class="card">
+            <dt>降級狀態 / Fallback</dt>
+            <dd>不適用<small>尚無實驗或降級事件</small></dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="panel" aria-labelledby="pipeline-heading">
+        <div class="section-heading">
+          <div>
+            <h2 id="pipeline-heading">Milestone 1 · 預定離線流程</h2>
+            <p class="muted">流程設計，不代表已完成整合或正在執行。</p>
+          </div>
+          <span class="badge">全部尚未執行</span>
+        </div>
+        <ol class="pipeline">
+          <li class="step">
+            <span class="step-number" aria-hidden="true">01</span>
+            <h3>資料與規格確認</h3>
+            <p>本地 OHLCV、檔案雜湊、成本與時間分割</p>
+            <span class="step-status">規劃中／尚未執行</span>
+          </li>
+          <li class="step">
+            <span class="step-number" aria-hidden="true">02</span>
+            <h3>因果特徵與縮放</h3>
+            <p>僅在訓練集擬合，隔離驗證及 OOS 資料</p>
+            <span class="step-status">規劃中／尚未執行</span>
+          </li>
+          <li class="step">
+            <span class="step-number" aria-hidden="true">03</span>
+            <h3>多種子訓練</h3>
+            <p>CPU 單策略訓練，保留每個種子的證據</p>
+            <span class="step-status">規劃中／尚未執行</span>
+          </li>
+          <li class="step">
+            <span class="step-number" aria-hidden="true">04</span>
+            <h3>OOS 與基準對比</h3>
+            <p>共同會計引擎、真實成本與終端清算</p>
+            <span class="step-status">規劃中／尚未執行</span>
+          </li>
+          <li class="step">
+            <span class="step-number" aria-hidden="true">05</span>
+            <h3>離線審計報告</h3>
+            <p>交易帳本、風險指標、種子穩定性及限制</p>
+            <span class="step-status">規劃中／尚未執行</span>
+          </li>
+        </ol>
+      </section>
+
+      <div class="columns">
+        <section class="panel" aria-labelledby="decisions-heading">
+          <h2 id="decisions-heading">待確認的實驗條件</h2>
+          <ul>
+            <li><strong>歷史資料：</strong>路徑、來源、品種、週期與雜湊。</li>
+            <li><strong>策略與動作：</strong>策略規則、指標參數與目標倉位定義。</li>
+            <li><strong>交易規格：</strong>部位單位、點差、佣金、滑點、隔夜費與清算公式。</li>
+            <li><strong>評估設計：</strong>訓練／驗證／測試日期、基準及比較方法。</li>
+          </ul>
+          <details>
+            <summary>查看未確認提案（不是預設值）</summary>
+            <p>固定參數 EMA 交叉與 Buy &amp; Hold 對照；離散動作索引
+              <code>0/1/2</code> 對應目標倉位 <code>-1/0/+1</code>；
+              種子 <code>[7, 42, 99]</code>。均待確認，不會自動寫入正式設定。</p>
+          </details>
+        </section>
+
+        <section class="panel" aria-labelledby="boundary-heading">
+          <h2 id="boundary-heading">本階段的邊界</h2>
+          <ul>
+            <li>沒有背景工作、即時行情或執行事件紀錄。</li>
+            <li>沒有資料上傳、訓練、凍結設定或部署操作。</li>
+            <li>MT5、多資產排程與券商部署屬未來階段，不在此流程內。</li>
+            <li>工程驗收不等於策略獲利；三個種子不等於統計顯著性。</li>
+          </ul>
+        </section>
+      </div>
+
+      <section class="panel" aria-labelledby="note-heading">
+        <h2 id="note-heading">靜態規劃聲明 · 非執行日誌</h2>
+        <div class="planning-note">
+          <p class="code" lang="en">[Planning Mode Spec] Static specification view only. No active runtime records.</p>
+          <p>此頁不自動同步倉庫狀態。文件與原型內的規劃標記不能替代實際驗證證據，
+            也不構成離線執行、績效驗收或部署資格。</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <nav aria-label="規劃參考文件">
+        <a href="RL-Architecture.md">分階段架構與驗證規劃</a>
+        <a href="config/offline_experiment.template.json">未凍結設定模板</a>
+        <a href="README.md">倉庫說明</a>
+      </nav>
+      <p>本地自包含 HTML / CSS · 無 JavaScript、外部資源或網路請求</p>
+    </footer>
+  </div>
+</body>
+</html>

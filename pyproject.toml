@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-bot"
+version = "0.1.0"
+description = "CPU-first quantitative optimization and reinforcement-learning scaffold"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+py-modules = ["orchestrator", "optimizer"]
+
+[project.optional-dependencies]
+telegram = ["requests>=2.31"]
+optimizer = ["optuna>=4.0,<5", "stable-baselines3>=2.2", "gymnasium>=0.29", "torch>=2.1", "pandas>=2.0", "numpy>=1.24"]
+xgb = ["xgboost>=2.0", "scikit-learn>=1.4", "scipy>=1.10", "pandas>=2.0", "numpy>=1.24"]
+onnx = ["onnx>=1.14", "onnxmltools>=1.12", "onnxruntime>=1.16"]
+data = ["pandas>=2.0", "numpy>=1.24"]
+env = ["gymnasium>=0.29", "pandas>=2.0", "numpy>=1.24"]
+sb3 = ["stable-baselines3>=2.2", "gymnasium>=0.29", "torch>=2.1", "onnx>=1.14", "pandas>=2.0", "numpy>=1.24"]
+torchrl = ["torchrl>=0.4", "tensordict>=0.4", "torch>=2.1"]
+mt5 = ["MetaTrader5>=5.0"]
+ibkr = ["ib_insync>=0.9"]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["quant_optimization_bot*", "governance*", "data*", "engine_rl*", "engine_mt5*", "models*"]

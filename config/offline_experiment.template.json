@@ -1,0 +1,122 @@
+{
+  "template_version": 1,
+  "specification_status": "DRAFT_NOT_EXECUTABLE",
+  "frozen": false,
+  "experiment_id": null,
+  "milestone": "offline_single_strategy_validation",
+  "proposals_not_confirmed": {
+    "strategy": "fixed_ema_crossover",
+    "baselines": ["fixed_ema_crossover", "buy_and_hold"],
+    "policy_control": "target_position_not_indicator_parameters",
+    "discrete_action_index_to_target": {"0": -1, "1": 0, "2": 1},
+    "seeds": [7, 42, 99]
+  },
+  "dataset": {
+    "path": null,
+    "sha256": null,
+    "format": null,
+    "source_description": null,
+    "symbol": null,
+    "timeframe": null,
+    "timezone": null,
+    "timestamp_meaning": null,
+    "price_basis": null,
+    "column_mapping": null,
+    "missing_bar_policy": null
+  },
+  "splits": {
+    "boundary_convention": "start_inclusive_end_exclusive",
+    "train": {"start": null, "end": null},
+    "validation": {"start": null, "end": null},
+    "test": {"start": null, "end": null}
+  },
+  "instrument": {
+    "asset_type": null,
+    "account_currency": null,
+    "quote_currency": null,
+    "currency_conversion_rule": null,
+    "starting_cash": null,
+    "tick_size": null,
+    "point_value_per_unit": null,
+    "position_unit": null,
+    "minimum_position_increment": null,
+    "position_sizing_rule": null,
+    "leverage": null,
+    "margin_rule": null,
+    "bankruptcy_policy": null
+  },
+  "strategy": {
+    "name": null,
+    "ema": {"fast_period": null, "slow_period": null, "initialization_rule": null},
+    "signal_rule": null,
+    "position_between_crossovers": null,
+    "shorting_allowed": null
+  },
+  "policy": {
+    "controls": null,
+    "action_space_type": null,
+    "discrete_action_index_to_target": null,
+    "target_position_units": null,
+    "reward_definition": null
+  },
+  "features": {
+    "ordered_names": null,
+    "indicator_parameters": null,
+    "warmup_bars": null,
+    "scaler_method": null,
+    "scaler_fit_partition": "train_only",
+    "refit_on_validation_or_test": false
+  },
+  "execution": {
+    "decision_timing": null,
+    "fill_timing": null,
+    "fill_price_rule": null,
+    "final_bar_entry_policy": null,
+    "terminal_liquidation_price_rule": null,
+    "terminal_liquidation_cost_rule": null
+  },
+  "costs": {
+    "spread": {"value": null, "unit": null, "application_rule": null},
+    "commission": {"value": null, "unit": null, "application_rule": null},
+    "slippage": {"value": null, "unit": null, "application_rule": null},
+    "swap": {
+      "long_value": null,
+      "short_value": null,
+      "unit": null,
+      "rollover_timezone": null,
+      "rollover_time": null,
+      "day_count_and_multiplier_rule": null
+    }
+  },
+  "training": {
+    "algorithm": null,
+    "device": "cpu",
+    "seeds": null,
+    "threads_per_worker": null,
+    "total_timesteps_per_seed": null,
+    "ppo_hyperparameters": null,
+    "policy_architecture": "linear_actor",
+    "checkpoint_selection_rule": null,
+    "determinism_settings": null
+  },
+  "evaluation": {
+    "baseline_rules": null,
+    "deterministic_policy": null,
+    "return_sampling_frequency": null,
+    "sharpe_definition": null,
+    "annualization_periods": null,
+    "undefined_metric_policy": null,
+    "research_gate_thresholds": null,
+    "seed_stability_rule": null,
+    "baseline_comparison_protocol": null,
+    "statistical_claim_method": null,
+    "reproduction_tolerance": null
+  },
+  "safety": {
+    "offline_only": true,
+    "network_access_allowed": false,
+    "broker_execution_allowed": false,
+    "active_config_writes_allowed": false,
+    "automatic_deployment_allowed": false
+  }
+}

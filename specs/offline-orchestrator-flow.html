@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Offline Orchestrator | RL Research Console</title>
+  <style>
+    :root { color-scheme: dark; --bg:#090f18; --panel:#101b29; --line:#293c50; --text:#e6edf5; --muted:#a4b6c9; --cyan:#6ee7f0; --green:#80e1b0; --amber:#f3c982; --red:#ff8d9d; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:radial-gradient(ellipse at 85% 0%, #153144 0, transparent 45%),var(--bg); color:var(--text); font:15px/1.6 system-ui,sans-serif; }
+    main { max-width:1260px; margin:auto; padding:38px 28px; }
+    a { color:var(--cyan); text-underline-offset:4px; }
+    :focus-visible { outline:2px solid var(--cyan); outline-offset:5px; }
+    .skip { position:absolute; top:-80px; padding:10px; background:var(--panel); }
+    .skip:focus { top:10px; }
+    .masthead,.heading,.controls,.status-grid { display:flex; gap:20px; justify-content:space-between; align-items:center; }
+    .eyebrow { font:11px ui-monospace,Consolas,monospace; letter-spacing:.18em; color:var(--cyan); text-transform:uppercase; }
+    h1 { font-size:clamp(26px,4vw,40px); line-height:1.15; letter-spacing:-.04em; margin:12px 0; }
+    h2 { font-size:17px; margin:0; font-weight:600; }
+    p { margin:7px 0; }
+    .muted,small { color:var(--muted); }
+    .tag { border:1px solid var(--line); border-radius:4px; padding:6px 10px; font:11px ui-monospace,Consolas,monospace; max-width:100%; }
+    .notice { margin:26px 0 20px; padding:14px 18px; border:1px solid #655438; border-left:3px solid var(--amber); background:#211f20; font-size:13px; }
+    .notice strong { color:var(--amber); }
+    .controls { flex-wrap:wrap; padding:18px 0; }
+    button { cursor:pointer; font:600 13px system-ui,sans-serif; border:1px solid var(--cyan); background:var(--cyan); color:#071724; border-radius:5px; padding:12px 20px; }
+    button:hover { filter:brightness(1.1); }
+    button:disabled { cursor:wait; opacity:.6; }
+    button.secondary { color:var(--text); background:transparent; border-color:var(--line); }
+    .actions { display:flex; gap:10px; }
+    .toggle { display:flex; align-items:center; gap:10px; cursor:pointer; font-size:13px; }
+    input { accent-color:var(--red); width:19px; height:19px; }
+    .status-grid { align-items:stretch; gap:1px; background:var(--line); border:1px solid var(--line); border-radius:7px; overflow:hidden; margin:8px 0 24px; }
+    .stat { background:var(--panel); padding:16px 18px; flex:1; min-width:0; }
+    .stat dt { font:10px ui-monospace,Consolas,monospace; text-transform:uppercase; letter-spacing:.1em; color:var(--muted); }
+    .stat dd { margin:9px 0 0; font:12px ui-monospace,Consolas,monospace; overflow-wrap:anywhere; }
+    #overall { color:var(--amber); }
+    .panel { border:1px solid var(--line); border-radius:8px; background:linear-gradient(120deg,#111e2d,#0e1825); margin-top:18px; overflow:hidden; }
+    .heading { padding:18px 22px; border-bottom:1px solid var(--line); }
+    .heading .number { color:var(--cyan); margin-right:12px; font:12px ui-monospace,Consolas,monospace; }
+    .heading small { font:11px ui-monospace,Consolas,monospace; }
+    .diagram { overflow-x:auto; padding:12px 20px; }
+    svg { width:100%; display:block; min-width:680px; }
+    svg text { fill:var(--text); font-family:ui-monospace,Consolas,monospace; }
+    svg .sub { fill:var(--muted); font-size:12px; }
+    svg .title { font-size:15px; font-weight:600; }
+    .node { fill:#122334; stroke:var(--line); stroke-width:1.5; }
+    .gate[data-status="active"] .node { stroke:var(--cyan); }
+    .gate[data-status="pass"] .node { stroke:var(--green); fill:#122d2a; }
+    .gate[data-status="fail"] .node { stroke:var(--red); fill:#361e2b; }
+    .gate[data-status="pass"] .gate-status { fill:var(--green); }
+    .gate[data-status="fail"] .gate-status { fill:var(--red); }
+    .wire { stroke:var(--line); stroke-width:2; fill:none; }
+    #packet { fill:var(--cyan); filter:drop-shadow(0 0 5px #6ee7f0); }
+    .lane-base { fill:#1c2a3b; }
+    .lane-progress { fill:var(--cyan); }
+    .lane-marker { fill:var(--green); }
+    .footnote { padding:0 22px 18px; font-size:12px; color:var(--muted); }
+    #event { min-height:30px; padding:5px 0; font:12px ui-monospace,Consolas,monospace; color:var(--cyan); }
+    .receipt { transform:translateY(16px); transition:transform .5s; }
+    .receipt.visible { opacity:1; transform:translateY(0); }
+    .receipt-border { fill:#0b1622; stroke:#456477; stroke-dasharray:5 5; }
+    #stamp { fill:var(--amber); font-size:17px; font-weight:700; }
+    .metric { font-size:34px; font-weight:600; fill:var(--cyan); }
+    .digest { font-size:12px; fill:#b6cddd; }
+    .ledger { margin:16px 22px; border-collapse:collapse; width:calc(100% - 44px); font:12px ui-monospace,Consolas,monospace; }
+    .table-scroll { overflow-x:auto; }
+    th,td { text-align:right; padding:9px 10px; border-bottom:1px solid var(--line); }
+    th:first-child,td:first-child { text-align:left; }
+    th { color:var(--muted); font-weight:400; }
+    details { margin-top:22px; padding:16px 20px; border:1px solid var(--line); border-radius:6px; color:var(--muted); font-size:13px; }
+    summary { cursor:pointer; color:var(--text); }
+    footer { display:flex; flex-wrap:wrap; gap:20px; margin-top:24px; font-size:12px; color:var(--muted); }
+    noscript p { padding:20px; border:1px solid var(--red); }
+    @media(max-width:760px) {
+      main { padding:24px 14px; }
+      .masthead,.heading { align-items:flex-start; }
+      .masthead { flex-direction:column; gap:8px; }
+      .status-grid { flex-wrap:wrap; }
+      .stat { flex:1 1 45%; }
+      .heading { padding:16px; }
+      .heading small { max-width:115px; text-align:right; }
+      .diagram { padding:10px; }
+    }
+    @media(prefers-reduced-motion:reduce) {
+      .receipt { transition:none; transform:none; }
+      #packet { filter:none; }
+    }
+  </style>
+</head>
+<body>
+  <a href="#console" class="skip">Skip to research console</a>
+  <main id="console">
+    <header class="masthead">
+      <div>
+        <div class="eyebrow">Vibe-Trading / Quantitative research systems</div>
+        <h1>Offline Orchestrator Flow<span style="color:var(--cyan)">.</span></h1>
+        <p class="muted">Milestone 01 &nbsp;/&nbsp; Validate → Train → Audit</p>
+      </div>
+      <span class="tag">LOCAL DEMO · ZERO DEPENDENCIES</span>
+    </header>
+    <aside class="notice">
+      <strong>SYNTHETIC VISUALIZATION — NOT AN EXPERIMENT</strong>
+      <p>This page animates an embedded fixture, not your configuration or market data.
+        Hashes identify demo bytes only. No actual RL training, file evidence validation, or trading occurs.
+        The repository experiment remains unfrozen and incomplete.</p>
+    </aside>
+    <div class="controls">
+      <div class="actions">
+        <button id="execute" type="button">▶ Execute Pipeline</button>
+        <button id="reset" class="secondary" type="button">Reset</button>
+      </div>
+      <label class="toggle"><input id="mismatch" type="checkbox"> Force L3 Hash Mismatch</label>
+    </div>
+    <dl class="status-grid">
+      <div class="stat"><dt>Demo readiness state</dt><dd id="overall">DRAFT_INCOMPLETE</dd></div>
+      <div class="stat"><dt>Independent evidence</dt><dd id="evidence">EVIDENCE_UNCHECKED</dd></div>
+      <div class="stat"><dt>Demo run lifecycle</dt><dd id="lifecycle">NOT_STARTED</dd></div>
+      <div class="stat"><dt>Research decision</dt><dd id="decision">NOT_EVALUATED</dd></div>
+    </dl>
+    <div id="event" role="status" aria-live="polite" aria-atomic="true">Demo idle. No validation has been performed.</div>
+
+    <section class="panel" aria-labelledby="cascade-title">
+      <div class="heading"><h2 id="cascade-title"><span class="number">01</span>Validation cascade</h2><small>FAIL-CLOSED / L1–L3</small></div>
+      <div class="diagram" tabindex="0" role="region" aria-label="Scrollable validation diagram">
+        <svg viewBox="0 0 1040 195" role="img" aria-labelledby="cascade-svg-title cascade-desc">
+          <title id="cascade-svg-title">Configuration validation gates</title>
+          <desc id="cascade-desc">A synthetic config passes structure, logic, then data hash verification. Any known failure is INVALID.</desc>
+          <path class="wire" d="M70 92 H970"/>
+          <circle cx="45" cy="92" r="20" fill="#1b3345"/><text x="45" y="97" text-anchor="middle" font-size="12">CFG</text>
+          <g class="gate" id="gate-1" data-status="pending">
+            <rect class="node" x="110" y="35" width="245" height="115" rx="8"/>
+            <text class="sub" x="130" y="61">LAYER 1</text><text class="title" x="130" y="87">Schema &amp; Structure</text>
+            <text class="sub" x="130" y="110">Types · required · unknown keys</text>
+            <text class="gate-status sub" x="130" y="133">UNCHECKED</text>
+          </g>
+          <g class="gate" id="gate-2" data-status="pending">
+            <rect class="node" x="395" y="35" width="245" height="115" rx="8"/>
+            <text class="sub" x="415" y="61">LAYER 2</text><text class="title" x="415" y="87">Logical Consistency</text>
+            <text class="sub" x="415" y="110">Splits · bounds · distinct seeds</text>
+            <text class="gate-status sub" x="415" y="133">UNCHECKED</text>
+          </g>
+          <g class="gate" id="gate-3" data-status="pending">
+            <rect class="node" x="680" y="35" width="245" height="115" rx="8"/>
+            <text class="sub" x="700" y="61">LAYER 3</text><text class="title" x="700" y="87">Data Evidence &amp; Hash</text>
+            <text class="sub" x="700" y="110">SHA-256 · gaps · causal warm-up</text>
+            <text class="gate-status sub" x="700" y="133">UNCHECKED</text>
+          </g>
+          <circle id="packet" cx="70" cy="92" r="5" visibility="hidden"/>
+          <text class="sub" x="110" y="178">INVALID &gt; DRAFT_INCOMPLETE &gt; EVIDENCE_UNCHECKED &gt; READY</text>
+        </svg>
+      </div>
+      <p class="footnote">Readiness is granted at the validation boundary, before training. It is offline permission, never a profitability or deployment claim.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="lanes-title">
+      <div class="heading"><h2 id="lanes-title"><span class="number">02</span>Multi-seed execution</h2><small>3 DISTINCT SEEDS / DEMO</small></div>
+      <div class="diagram" tabindex="0" role="region" aria-label="Scrollable seed execution diagram">
+        <svg viewBox="0 0 1040 255" role="img" aria-labelledby="lanes-svg-title lanes-desc">
+          <title id="lanes-svg-title">Three independently animated RL seed swimlanes</title>
+          <desc id="lanes-desc">Seed 7, seed 42 and seed 99 move through training, validation selection and untouched OOS evaluation.</desc>
+          <text class="sub" x="150" y="25">TRAIN</text><text class="sub" x="596" y="25">VALIDATE / FREEZE</text><text class="sub" x="786" y="25">OOS TEST</text>
+          <path class="wire" stroke-dasharray="3 6" d="M585 38 V228 M780 38 V228"/>
+          <g id="lane-7"><text x="18" y="76" class="title">SEED 07</text><rect class="lane-base" x="150" y="59" width="760" height="18" rx="4"/><rect class="lane-progress" x="150" y="59" width="0" height="18" rx="4"/><text class="sub lane-status" x="930" y="74">IDLE</text><circle class="lane-marker" cx="150" cy="68" r="4"/></g>
+          <g id="lane-42"><text x="18" y="140" class="title">SEED 42</text><rect class="lane-base" x="150" y="123" width="760" height="18" rx="4"/><rect class="lane-progress" x="150" y="123" width="0" height="18" rx="4"/><text class="sub lane-status" x="930" y="138">IDLE</text><circle class="lane-marker" cx="150" cy="132" r="4"/></g>
+          <g id="lane-99"><text x="18" y="204" class="title">SEED 99</text><rect class="lane-base" x="150" y="187" width="760" height="18" rx="4"/><rect class="lane-progress" x="150" y="187" width="0" height="18" rx="4"/><text class="sub lane-status" x="930" y="202">IDLE</text><circle class="lane-marker" cx="150" cy="196" r="4"/></g>
+          <text class="sub" x="150" y="244">Shared barrier: every model frozen before any OOS evaluation begins.</text>
+        </svg>
+      </div>
+      <p class="footnote">Parallel tracks illustrate independent runs; the specified CPU orchestrator may run seeds sequentially. No best-seed selection. Three seeds ≠ statistical significance.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="audit-title">
+      <div class="heading"><h2 id="audit-title"><span class="number">03</span>Offline audit certificate</h2><small>ILLUSTRATIVE RECEIPT / NOT PROOF</small></div>
+      <div id="receipt" class="receipt">
+        <div class="diagram" tabindex="0" role="region" aria-label="Scrollable illustrative audit certificate">
+          <svg viewBox="0 0 1040 340" role="img" aria-labelledby="receipt-title receipt-desc">
+            <title id="receipt-title">Demo offline audit report</title>
+            <desc id="receipt-desc">Shows actual hashes of embedded synthetic bytes and illustrative median OOS metrics, not real experimental evidence.</desc>
+            <rect class="receipt-border" x="4" y="4" width="1032" height="330" rx="7"/>
+            <path d="M27 48 V27 H48 M992 27 H1013 V48 M27 290 V311 H48 M992 311 H1013 V290" fill="none" stroke="#6ee7f0" stroke-width="2"/>
+            <text class="sub" x="50" y="45">RL / OFFLINE RESEARCH ONLY</text><text class="sub" x="987" y="45" text-anchor="end">SYNTHETIC · v1.0</text>
+            <text id="stamp" x="50" y="83">DRAFT_INCOMPLETE</text>
+            <text class="sub" x="50" y="112">Permission state only — not a research PASS or live authorization</text>
+            <text class="sub" x="50" y="150">MEDIAN OOS PROFIT FACTOR</text><text class="sub" x="470" y="150">MEDIAN OOS SHARPE</text>
+            <text id="median-pf" class="metric" x="50" y="191">—</text><text id="median-sharpe" class="metric" x="470" y="191">—</text>
+            <text class="sub" x="50" y="225">DEMO CONFIG SHA-256</text><text id="config-hash" class="digest" x="50" y="246">NOT COMPUTED</text>
+            <text class="sub" x="50" y="273">DEMO DATA SHA-256 (ACTUAL CONSUMED BYTES)</text><text id="data-hash" class="digest" x="50" y="294">NOT COMPUTED</text>
+          </svg>
+        </div>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable synthetic metrics table">
+          <table class="ledger" aria-label="Synthetic per-seed OOS metrics">
+            <thead><tr><th>Seed</th><th>Profit factor</th><th>Sharpe</th><th>Max DD</th><th>Trades</th></tr></thead>
+            <tbody id="seed-metrics"><tr><td colspan="5">Awaiting demo execution — no results.</td></tr></tbody>
+          </table>
+        </div>
+        <p id="audit-note" class="footnote">No audit generated. Metric fixtures are not measured trading results.</p>
+      </div>
+    </section>
+    <details>
+      <summary>State-machine rules &amp; methodology</summary>
+      <p>Known errors always resolve to INVALID. Otherwise, unresolved applicable settings or missing freeze confirmation resolve to DRAFT_INCOMPLETE.
+        Complete frozen settings with pending evidence resolve to EVIDENCE_UNCHECKED.
+        Only all passing gates grant READY_FOR_OFFLINE_EXECUTION. Changing inputs revokes prior evidence.</p>
+      <p>Median PF ≥ 1.25 and median Sharpe ≥ 1.0 are aggregate research gates. Every seed must also have drawdown ≤ 10%,
+        at least 30 trades, and positive net expectancy. Missing, failed or undefined RL metrics fail closed.
+        A hash mismatch prevents every training lane from starting.</p>
+      <p>Demo timeline: train [2020-01-01, 2022-01-01), validation [2022-01-01, 2023-01-01),
+        test [2023-01-01, 2024-01-01), all UTC. These are fixture dates, not selected repository splits.</p>
+    </details>
+    <noscript><p>JavaScript is disabled. The demo remains DRAFT_INCOMPLETE; no validation or execution occurs.</p></noscript>
+    <footer><a href="offline-orchestrator-flow.md">Formal flow specification</a><a href="../RL-Architecture.md">Architecture</a><span>No network · No broker · No persistent state · Demo hashes via Web Crypto</span></footer>
+  </main>
+  <script id="flow-model">
+    "use strict";
+    // Readiness and research performance are deliberately independent decisions.
+    const FlowModel = (() => {
+      const seeds = [7, 42, 99];
+      function resolve({ errors, complete, frozen, checks }) {
+        if (typeof complete !== "boolean"
+          || (frozen != null && typeof frozen !== "boolean")
+          || checks.some(check => !["PASS", "FAIL", "UNCHECKED"].includes(check))) return "INVALID";
+        if (errors.length || checks.includes("FAIL") || (frozen && !complete)) return "INVALID";
+        if (!complete || frozen !== true) return "DRAFT_INCOMPLETE";
+        if (checks.length !== 3 || checks.some(check => check !== "PASS")) return "EVIDENCE_UNCHECKED";
+        return "READY_FOR_OFFLINE_EXECUTION";
+      }
+      function median(values) {
+        if (!values.length || values.some(value => !Number.isFinite(value))) return null;
+        const sorted = [...values].sort((a, b) => a - b);
+        const middle = Math.floor(sorted.length / 2);
+        return sorted.length % 2 ? sorted[middle] : sorted[middle - 1] / 2 + sorted[middle] / 2;
+      }
+      function audit(rows, expectedSeeds = seeds) {
+        const valid = expectedSeeds.length >= 3 && new Set(expectedSeeds).size === expectedSeeds.length
+          && expectedSeeds.every(Number.isInteger) && rows.length === expectedSeeds.length
+          && new Set(rows.map(row => row.seed)).size === rows.length
+          && expectedSeeds.every(seed => rows.some(row => row.seed === seed))
+          && rows.every(row => row.complete === true && [row.pf, row.sharpe, row.dd, row.trades, row.expectancy].every(Number.isFinite));
+        const pf = valid ? median(rows.map(row => row.pf)) : null;
+        const sharpe = valid ? median(rows.map(row => row.sharpe)) : null;
+        const pass = valid && pf >= 1.25 && sharpe >= 1
+          && rows.every(row => row.dd >= 0 && row.dd <= .1 && Number.isInteger(row.trades) && row.trades >= 30 && row.expectancy > 0);
+        return { pf, sharpe, pass };
+      }
+      return { seeds, resolve, median, audit };
+    })();
+    globalThis.FlowModel = FlowModel;
+  </script>
+  <script>
+    "use strict";
+    (() => {
+      const $ = id => document.getElementById(id);
+      const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
+      const fixtureRows = [
+        { seed:7, pf:1.42, sharpe:1.18, dd:.064, trades:48, expectancy:18.4, complete:true },
+        { seed:42, pf:1.57, sharpe:1.31, dd:.072, trades:52, expectancy:21.6, complete:true },
+        { seed:99, pf:1.36, sharpe:1.09, dd:.081, trades:45, expectancy:16.2, complete:true }
+      ];
+      let generation = 0;
+      let state;
+      let busy = false;
+      const checks = () => state.checks;
+      function announce(message) { $("event").textContent = message; }
+      function renderState() {
+        const readiness = FlowModel.resolve(state);
+        $("overall").textContent = readiness;
+        $("stamp").textContent = readiness;
+        const color = readiness === "INVALID" ? "var(--red)" : readiness === "READY_FOR_OFFLINE_EXECUTION" ? "var(--green)" : "var(--amber)";
+        $("overall").style.color = color;
+        $("stamp").style.fill = color;
+        $("evidence").textContent = checks()[2] === "PASS" ? "DEMO EVIDENCE PASS" : checks()[2] === "FAIL" ? "HASH MISMATCH / FAIL" : "EVIDENCE_UNCHECKED";
+      }
+      function gate(index, status) {
+        const node = $(`gate-${index + 1}`);
+        node.dataset.status = status;
+        node.querySelector(".gate-status").textContent = { pending:"UNCHECKED", active:"CHECKING FIXTURE…", pass:"PASS / DEMO", fail:"FAIL / HASH MISMATCH" }[status];
+      }
+      function reset() {
+        generation++;
+        busy = false;
+        state = { errors:[], complete:false, frozen:false, checks:["UNCHECKED", "UNCHECKED", "UNCHECKED"] };
+        $("execute").disabled = false;
+        $("lifecycle").textContent = "NOT_STARTED";
+        $("decision").textContent = "NOT_EVALUATED";
+        $("receipt").classList.remove("visible");
+        $("packet").setAttribute("visibility", "hidden");
+        $("packet").setAttribute("cx", "70");
+        ["median-pf", "median-sharpe"].forEach(id => { $(id).textContent = "—"; });
+        ["config-hash", "data-hash"].forEach(id => { $(id).textContent = "NOT COMPUTED"; });
+        $("seed-metrics").replaceChildren();
+        const row = $("seed-metrics").insertRow();
+        const cell = row.insertCell(); cell.colSpan = 5; cell.textContent = "Awaiting demo execution — no results.";
+        $("audit-note").textContent = "No audit generated. Metric fixtures are not measured trading results.";
+        FlowModel.seeds.forEach(seed => {
+          const lane = $(`lane-${seed}`);
+          lane.querySelector(".lane-progress").setAttribute("width", "0");
+          lane.querySelector(".lane-marker").setAttribute("cx", "150");
+          lane.querySelector(".lane-status").textContent = "IDLE";
+        });
+        [0, 1, 2].forEach(index => gate(index, "pending"));
+        renderState();
+        announce("Demo idle. No validation has been performed.");
+      }
+      function current(token) {
+        if (token !== generation) throw new DOMException("Demo cancelled", "AbortError");
+      }
+      function animate(duration, update, token) {
+        return new Promise((resolve, reject) => {
+          let start;
+          function frame(time) {
+            try {
+              current(token);
+              start ??= time;
+              const progress = reducedMotion.matches ? 1 : Math.min((time - start) / duration, 1);
+              update(progress);
+              if (progress === 1) resolve(); else requestAnimationFrame(frame);
+            } catch (error) { reject(error); }
+          }
+          requestAnimationFrame(frame);
+        });
+      }
+      async function digest(bytes) {
+        if (!globalThis.crypto?.subtle) throw new Error("Web Crypto unavailable. Open this file in a secure modern browser.");
+        const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(bytes));
+        return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("");
+      }
+      function invalidateHash(inputChanged = false) {
+        generation++;
+        busy = false;
+        checks()[2] = "FAIL";
+        state.errors = ["DEMO_HASH_MISMATCH"];
+        gate(2, "fail");
+        $("packet").setAttribute("visibility", "hidden");
+        $("execute").disabled = false;
+        $("decision").textContent = "FAIL / DEMO INPUT INVALID";
+        $("lifecycle").textContent = ["RUNNING", "COMPLETE"].includes($("lifecycle").textContent) ? "FAILED" : "NOT_STARTED";
+        FlowModel.seeds.forEach(seed => {
+          const label = $(`lane-${seed}`).querySelector(".lane-status");
+          if (label.textContent !== "IDLE") label.textContent = "REVOKED";
+        });
+        $("receipt").classList.add("visible");
+        ["median-pf", "median-sharpe"].forEach(id => { $(id).textContent = "—"; });
+        $("seed-metrics").replaceChildren();
+        if (inputChanged) $("data-hash").textContent = "REVOKED / DEMO INPUT CHANGED — RE-EXECUTE TO HASH";
+        $("audit-note").textContent = "FAIL — demo hash mismatch. Prior fixture results revoked; no offline execution permission.";
+        renderState();
+        announce("INVALID — L3 hash mismatch. Flow stopped; training and OOS results are blocked or revoked.");
+      }
+      async function lanePhase(seed, phase, from, to, duration, token) {
+        const lane = $(`lane-${seed}`);
+        lane.querySelector(".lane-status").textContent = phase;
+        await animate(duration, progress => {
+          const fraction = from + (to - from) * progress;
+          lane.querySelector(".lane-progress").setAttribute("width", String(760 * fraction));
+          lane.querySelector(".lane-marker").setAttribute("cx", String(150 + 760 * fraction));
+        }, token);
+        lane.querySelector(".lane-status").textContent = to === 1 ? "DONE" : "FROZEN";
+      }
+      async function execute() {
+        reset();
+        busy = true;
+        $("execute").disabled = true;
+        const token = generation;
+        // These bytes are intentionally tiny synthetic fixtures, never market evidence.
+        const data = "demo-only,timestamp,close\nfixture,2023-01-01T00:00:00Z,100\n";
+        try {
+          const expectedHash = await digest(data);
+          const config = JSON.stringify({ demo:true, frozen:true, seeds:FlowModel.seeds, dataset_sha256:expectedHash, fixture_version:1 });
+          const configHash = await digest(config);
+          current(token);
+          state.complete = true;
+          state.frozen = true;
+          renderState();
+          $("config-hash").textContent = configHash;
+          for (let index = 0; index < 3; index++) {
+            gate(index, "active");
+            announce(`Demo L${index + 1}: ${["schema and structure", "logical consistency", "embedded data identity"][index]} inspection.`);
+            $("packet").setAttribute("visibility", "visible");
+            const from = index === 0 ? 70 : 232 + (index - 1) * 285;
+            const to = 232 + index * 285;
+            await animate(850, progress => $("packet").setAttribute("cx", String(from + (to - from) * progress)), token);
+            if (index === 2) {
+              const actualHash = await digest($("mismatch").checked ? data + "tampered\n" : data);
+              current(token);
+              $("data-hash").textContent = actualHash;
+              if (actualHash !== expectedHash) { invalidateHash(); return; }
+            }
+            checks()[index] = "PASS";
+            gate(index, "pass");
+            renderState();
+          }
+          $("packet").setAttribute("visibility", "hidden");
+          if (FlowModel.resolve(state) !== "READY_FOR_OFFLINE_EXECUTION") throw new Error("Readiness gate refused demo execution.");
+          $("lifecycle").textContent = "RUNNING";
+          announce("Demo gates passed. Offline permission granted; animating synthetic seed training and validation.");
+          // All seeds reach the model-freeze barrier before any seed enters OOS.
+          await Promise.all(FlowModel.seeds.map((seed, index) => lanePhase(seed, "TRAIN", 0, .57, 1700 + index * 380, token)
+            .then(() => lanePhase(seed, "VAL", .57, .83, 700 + index * 140, token))));
+          current(token);
+          announce("Every demo policy frozen. Animating independent untouched OOS tracks.");
+          await Promise.all(FlowModel.seeds.map((seed, index) => lanePhase(seed, "OOS", .83, 1, 850 + index * 260, token)));
+          current(token);
+          const result = FlowModel.audit(fixtureRows);
+          $("median-pf").textContent = result.pf?.toFixed(2) ?? "UNDEFINED";
+          $("median-sharpe").textContent = result.sharpe?.toFixed(2) ?? "UNDEFINED";
+          $("seed-metrics").replaceChildren();
+          fixtureRows.forEach(item => {
+            const row = $("seed-metrics").insertRow();
+            [item.seed, item.pf.toFixed(2), item.sharpe.toFixed(2), `${(item.dd * 100).toFixed(1)}%`, item.trades]
+              .forEach(value => { row.insertCell().textContent = String(value); });
+          });
+          $("lifecycle").textContent = "COMPLETE";
+          $("decision").textContent = result.pass ? "ILLUSTRATIVE PASS" : "ILLUSTRATIVE FAIL";
+          $("audit-note").textContent = "Synthetic audit only: median of all 3 fixture seeds; risk/sample/expectancy guards satisfied. Baseline accounting and real evidence are not implemented here. Not an actual audit PASS.";
+          $("receipt").classList.add("visible");
+          announce("Demo complete. Illustrative median PF 1.42 / Sharpe 1.18. READY is offline permission only; no real experiment passed.");
+        } catch (error) {
+          if (token !== generation || error.name === "AbortError") return;
+          state.errors.push(error.message);
+          $("lifecycle").textContent = "FAILED";
+          $("decision").textContent = "FAIL / DEMO ERROR";
+          $("packet").setAttribute("visibility", "hidden");
+          $("audit-note").textContent = `Demo failed: ${error.message}`;
+          $("receipt").classList.add("visible");
+          renderState();
+          announce(`INVALID — ${error.message}`);
+        } finally {
+          if (token === generation) { busy = false; $("execute").disabled = false; }
+        }
+      }
+      $("execute").addEventListener("click", execute);
+      $("reset").addEventListener("click", reset);
+      $("mismatch").addEventListener("change", () => {
+        if ($("mismatch").checked && (busy || $("lifecycle").textContent === "COMPLETE")) invalidateHash(true);
+        else {
+          reset();
+          announce($("mismatch").checked ? "Hash mismatch armed. Execute to demonstrate fail-closed L3." : "Fixture input changed. Prior evidence cleared; execute to revalidate.");
+        }
+      });
+      reset();
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "assets": ["HK50.cash", "US500.cash", "US30.cash", "EURUSD"],
+  "strategies": ["ICT_OB_EA", "Trend_EMA_EA", "PPO_Distilled_Rules"],
+  "max_parallel_tasks": 2,
+  "parameter_bounds": {
+    "InpLeftBars": [2, 20],
+    "InpRightBars": [2, 20],
+    "InpFastEMA": [3, 50],
+    "InpSlowEMA": [20, 200],
+    "InpRSILongThreshold": [40, 75],
+    "InpBBPosThreshold": [0.0, 1.0],
+    "InpATRMultiplier": [0.5, 5.0]
+  }
+}
